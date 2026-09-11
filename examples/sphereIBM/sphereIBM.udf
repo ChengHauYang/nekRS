@@ -1,0 +1,85 @@
+#include "opSEM.hpp"
+
+#ifdef __okl__
+
+void udfDirichlet(bcData * bc)
+{
+  if (isField("FLUID VELOCITY"))
+  {
+    const dfloat topWallTolerance = 1e-12;
+    bc->uxFluid = bc->y > 1.0 - topWallTolerance ? 1.0 : 0.0;
+    bc->uyFluid = 0.0;
+    bc->uzFluid = 0.0;
+  }
+}
+
+#include "../staticIBM/ibmKernels.okl"
+
+#else
+
+#include "../staticIBM/staticSurfaceIBM.hpp"
+
+#include <cmath>
+#include <cstdio>
+
+namespace
+{
+ibm::StaticSurfaceIBM staticIbm;
+}
+
+void ibmForcing(double time)
+{
+  staticIbm.applyForcing(time);
+}
+
+void UDF_Setup0(MPI_Comm, setupAide & options)
+{
+  staticIbm.configure(options);
+
+  int ciMode = 0;
+  options.getArgs("CI-MODE", ciMode);
+  if (ciMode)
+    options.setArgs("END TIME", "0.004");
+}
+
+void UDF_Setup()
+{
+  staticIbm.setup(nrs);
+  nrs->userSource = &ibmForcing;
+}
+
+void UDF_LoadKernels(deviceKernelProperties & kernelInfo)
+{
+  kernelInfo.define("p_blockSize") = 256;
+}
+
+void UDF_ExecuteStep(double time, int tstep)
+{
+  if (!nrs->lastStep && !nrs->checkpointStep)
+    return;
+
+  const auto values = staticIbm.diagnostics();
+  if (platform->comm.mpiRank() == 0)
+    printf("sphereIBM step=%d time=%.8e slipMax=%.8e slipRms=%.8e "
+           "force=(%.8e, %.8e, %.8e)\n",
+           tstep,
+           time,
+           static_cast<double>(values.maximumSlip),
+           static_cast<double>(values.rmsSlip),
+           static_cast<double>(values.force[0]),
+           static_cast<double>(values.force[1]),
+           static_cast<double>(values.force[2]));
+
+  if (nrs->lastStep && staticIbm.ciMode())
+  {
+    const bool finite = std::isfinite(values.maximumSlip) && std::isfinite(values.rmsSlip) &&
+                        std::isfinite(values.force[0]) && std::isfinite(values.force[1]) &&
+                        std::isfinite(values.force[2]);
+    CiEvalTest("sphere IBM diagnostics are finite", finite);
+    CiEvalTest("sphere IBM receives nonzero lid-driven forcing",
+               std::abs(values.force[0]) > 1e-14 || values.maximumSlip > 1e-14);
+    CiFinalize();
+  }
+}
+
+#endif
