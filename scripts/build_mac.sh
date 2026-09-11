@@ -11,7 +11,7 @@ if [ -z ${CC} ] || [ -z ${CXX}  ] || [ -z ${FC}  ]; then
   read -p         "Press ENTER to continue with CC=$CC CXX=$CXX FC=$FC or ctrl-c to cancel"
 fi
 
-cmd="cmake -S . -B build -Wfatal-errors $@"
+cmd="cmake -S . -B build $@"
 echo $cmd
 eval $cmd
 if [ $? -eq 0 ] && [ ${NRSCONFIG_NOBUILD} -eq 0 ]; then
