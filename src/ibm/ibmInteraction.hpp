@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ibmGeometry.hpp"
+#include <array>
+#include <cctype>
 #include <vector>
 #include <cmath>
 #include <mpi.h>
@@ -59,77 +61,87 @@ struct BinHasher
   }
 };
 
-} // namespace detail
-
-/// Check that no marker support sphere crosses a periodic domain boundary.
-/// periodicDimensions contains characters from "xyz" indicating which dimensions
-/// are periodic. Empty string or "none" means no periodic dimensions.
-inline void checkPeriodicBoundaryExclusion(
-    const MarkerSet & markers,
-    const std::vector<dfloat> & node_x,
-    const std::vector<dfloat> & node_y,
-    const std::vector<dfloat> & node_z,
-    const double R,
-    const std::string & periodicDimensions,
-    MPI_Comm comm)
+struct PeriodicDomain
 {
-  if (periodicDimensions.empty() || periodicDimensions == "none") {
-    return;
+  std::array<bool, 3> enabled = {false, false, false};
+  std::array<double, 3> minimum = {0.0, 0.0, 0.0};
+  std::array<double, 3> length = {0.0, 0.0, 0.0};
+};
+
+struct ImageNode
+{
+  std::size_t index;
+  double x;
+  double y;
+  double z;
+};
+
+inline PeriodicDomain periodicDomain(const std::vector<dfloat> & node_x,
+                                     const std::vector<dfloat> & node_y,
+                                     const std::vector<dfloat> & node_z,
+                                     const double supportRadius,
+                                     const std::string & periodicDimensions,
+                                     MPI_Comm comm)
+{
+  PeriodicDomain domain;
+  std::string dimensions;
+  dimensions.reserve(periodicDimensions.size());
+  for (const unsigned char value : periodicDimensions)
+    if (!std::isspace(value) && value != ',')
+      dimensions.push_back(static_cast<char>(std::tolower(value)));
+
+  if (dimensions.empty() || dimensions == "none")
+    return domain;
+
+  for (const char dimension : dimensions)
+  {
+    if (dimension < 'x' || dimension > 'z')
+      throw std::invalid_argument(
+          "periodic_dimensions must be none or a combination of x, y, and z");
+    domain.enabled[dimension - 'x'] = true;
   }
 
-  bool px = periodicDimensions.find('x') != std::string::npos;
-  bool py = periodicDimensions.find('y') != std::string::npos;
-  bool pz = periodicDimensions.find('z') != std::string::npos;
-
-  if (!px && !py && !pz) return;
-
-  double localMin[3] = {
+  std::array<double, 3> localMinimum = {
       std::numeric_limits<double>::infinity(),
       std::numeric_limits<double>::infinity(),
       std::numeric_limits<double>::infinity()};
-  double localMax[3] = {
+  std::array<double, 3> localMaximum = {
       -std::numeric_limits<double>::infinity(),
       -std::numeric_limits<double>::infinity(),
       -std::numeric_limits<double>::infinity()};
-
-  const std::size_t Nlocal = node_x.size();
-  for (std::size_t n = 0; n < Nlocal; ++n) {
-    localMin[0] = std::min(localMin[0], static_cast<double>(node_x[n]));
-    localMin[1] = std::min(localMin[1], static_cast<double>(node_y[n]));
-    localMin[2] = std::min(localMin[2], static_cast<double>(node_z[n]));
-    localMax[0] = std::max(localMax[0], static_cast<double>(node_x[n]));
-    localMax[1] = std::max(localMax[1], static_cast<double>(node_y[n]));
-    localMax[2] = std::max(localMax[2], static_cast<double>(node_z[n]));
+  for (std::size_t n = 0; n < node_x.size(); ++n)
+  {
+    localMinimum[0] = std::min(localMinimum[0], static_cast<double>(node_x[n]));
+    localMinimum[1] = std::min(localMinimum[1], static_cast<double>(node_y[n]));
+    localMinimum[2] = std::min(localMinimum[2], static_cast<double>(node_z[n]));
+    localMaximum[0] = std::max(localMaximum[0], static_cast<double>(node_x[n]));
+    localMaximum[1] = std::max(localMaximum[1], static_cast<double>(node_y[n]));
+    localMaximum[2] = std::max(localMaximum[2], static_cast<double>(node_z[n]));
   }
 
-  double globalMin[3], globalMax[3];
-  MPI_Allreduce(localMin, globalMin, 3, MPI_DOUBLE, MPI_MIN, comm);
-  MPI_Allreduce(localMax, globalMax, 3, MPI_DOUBLE, MPI_MAX, comm);
+  std::array<double, 3> globalMaximum;
+  MPI_Allreduce(localMinimum.data(), domain.minimum.data(), 3, MPI_DOUBLE, MPI_MIN, comm);
+  MPI_Allreduce(localMaximum.data(), globalMaximum.data(), 3, MPI_DOUBLE, MPI_MAX, comm);
 
-  const std::size_t Np = markers.size();
-  for (std::size_t p = 0; p < Np; ++p) {
-    double mx = markers.coordinates[p];
-    double my = markers.coordinates[p + Np];
-    double mz = markers.coordinates[p + 2 * Np];
-
-    auto check = [&](bool is_periodic, double m, double gmin, double gmax, char dim) {
-      if (is_periodic) {
-        if (m - gmin < R || gmax - m < R) {
-          std::ostringstream oss;
-          oss << "Marker support sphere crosses periodic domain boundary in " << dim
-              << " dimension! Marker index: " << p
-              << ", coord: " << m << ", domain bounds: [" << gmin << ", " << gmax << "]"
-              << ", distances to boundary: " << (m - gmin) << " and " << (gmax - m)
-              << ", R: " << R;
-          throw std::runtime_error(oss.str());
-        }
-      }
-    };
-    check(px, mx, globalMin[0], globalMax[0], 'x');
-    check(py, my, globalMin[1], globalMax[1], 'y');
-    check(pz, mz, globalMin[2], globalMax[2], 'z');
+  for (int component = 0; component < 3; ++component)
+  {
+    if (!domain.enabled[component])
+      continue;
+    domain.length[component] = globalMaximum[component] - domain.minimum[component];
+    if (!std::isfinite(domain.length[component]) ||
+        domain.length[component] <= 2.0 * supportRadius)
+    {
+      std::ostringstream message;
+      message << "periodic domain length in " << static_cast<char>('x' + component)
+              << " must be greater than twice the IBM support radius: length="
+              << domain.length[component] << ", R=" << supportRadius;
+      throw std::invalid_argument(message.str());
+    }
   }
+  return domain;
 }
+
+} // namespace detail
 
 inline InteractionMaps buildInteractionMaps(
     const MarkerSet& markers,
@@ -139,7 +151,8 @@ inline InteractionMaps buildInteractionMaps(
     const std::vector<dfloat>& node_jw,
     const double R,
     const double sigma,
-    MPI_Comm comm)
+    MPI_Comm comm,
+    const std::string & periodicDimensions = "none")
 {
   if (R <= 0.0 || sigma <= 0.0) {
     throw std::invalid_argument("R and sigma must be positive");
@@ -149,16 +162,38 @@ inline InteractionMaps buildInteractionMaps(
   const double sigma2 = sigma * sigma;
   const std::size_t Np = markers.size();
   const std::size_t Nlocal = node_x.size();
+  if (node_y.size() != Nlocal || node_z.size() != Nlocal || node_jw.size() != Nlocal)
+    throw std::invalid_argument("IBM node coordinate and quadrature arrays must have equal sizes");
+
+  const auto periodic =
+      detail::periodicDomain(node_x, node_y, node_z, R, periodicDimensions, comm);
 
   std::unordered_map<detail::Bin3D,
-                     std::vector<std::size_t>,
+                     std::vector<detail::ImageNode>,
                      detail::BinHasher> bins;
-  for (std::size_t n = 0; n < Nlocal; ++n) {
-    const detail::Bin3D bin = {
-        static_cast<long long>(std::floor(node_x[n] / R)),
-        static_cast<long long>(std::floor(node_y[n] / R)),
-        static_cast<long long>(std::floor(node_z[n] / R))};
-    bins[bin].push_back(n);
+  for (std::size_t n = 0; n < Nlocal; ++n)
+  {
+    for (int imageX = periodic.enabled[0] ? -1 : 0;
+         imageX <= (periodic.enabled[0] ? 1 : 0);
+         ++imageX)
+      for (int imageY = periodic.enabled[1] ? -1 : 0;
+           imageY <= (periodic.enabled[1] ? 1 : 0);
+           ++imageY)
+        for (int imageZ = periodic.enabled[2] ? -1 : 0;
+             imageZ <= (periodic.enabled[2] ? 1 : 0);
+             ++imageZ)
+        {
+          const detail::ImageNode image = {
+              n,
+              node_x[n] + imageX * periodic.length[0],
+              node_y[n] + imageY * periodic.length[1],
+              node_z[n] + imageZ * periodic.length[2]};
+          const detail::Bin3D bin = {
+              static_cast<long long>(std::floor(image.x / R)),
+              static_cast<long long>(std::floor(image.y / R)),
+              static_cast<long long>(std::floor(image.z / R))};
+          bins[bin].push_back(image);
+        }
   }
 
   std::vector<double> s_p_local(Np, 0.0);
@@ -192,10 +227,11 @@ inline InteractionMaps buildInteractionMaps(
           if (bin == bins.end())
             continue;
 
-          for (const std::size_t n : bin->second) {
-            const double dist2 = (px - node_x[n])*(px - node_x[n]) +
-                                 (py - node_y[n])*(py - node_y[n]) +
-                                 (pz - node_z[n])*(pz - node_z[n]);
+          for (const auto & image : bin->second) {
+            const std::size_t n = image.index;
+            const double dist2 = (px - image.x) * (px - image.x) +
+                                 (py - image.y) * (py - image.y) +
+                                 (pz - image.z) * (pz - image.z);
             if (dist2 <= R2) {
               const double G = detail::gaussian(dist2, sigma2);
               local_sp += G * node_jw[n];

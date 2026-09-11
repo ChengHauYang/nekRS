@@ -355,10 +355,8 @@ private:
       mesh->o_Jw.copyTo(jw.data(), mesh->Nlocal);
     }
 
-    checkPeriodicBoundaryExclusion(_markers, x, y, z, _supportRadius, _periodicDimensions, comm);
-
     _maps = buildInteractionMaps(
-        _markers, x, y, z, jw, _supportRadius, _gaussianWidth, comm);
+        _markers, x, y, z, jw, _supportRadius, _gaussianWidth, comm, _periodicDimensions);
 
     _oInterpOffsets = deviceMemory<dlong>(_maps.interp.offsets);
     _oInterpIndices = deviceMemory<dlong>(_maps.interp.indices);

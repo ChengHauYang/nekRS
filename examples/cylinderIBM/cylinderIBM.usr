@@ -1,0 +1,16 @@
+c-----------------------------------------------------------------------
+      subroutine usrdat2
+      include 'SIZE'
+      include 'TOTAL'
+
+c     Reconstruct the two non-periodic boundary IDs used by the par file.
+      do iel=1,nelv
+      do ifc=1,2*ndim
+         if (cbc(ifc,iel,1) .eq. 'v  ') boundaryID(ifc,iel) = 1
+         if (cbc(ifc,iel,1) .eq. 'O  ') boundaryID(ifc,iel) = 2
+      enddo
+      enddo
+
+      return
+      end
+c-----------------------------------------------------------------------

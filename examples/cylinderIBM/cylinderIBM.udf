@@ -1,0 +1,108 @@
+#include "opSEM.hpp"
+
+#ifdef __okl__
+
+void udfDirichlet(bcData * bc)
+{
+  if (isField("FLUID VELOCITY"))
+  {
+    bc->uxFluid = p_freeStreamVelocity;
+    bc->uyFluid = 0.0;
+    bc->uzFluid = 0.0;
+  }
+}
+
+#include "ibm/ibmKernels.okl"
+
+#else
+
+#include "ibm/staticSurfaceIBM.hpp"
+
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+namespace
+{
+ibm::StaticSurfaceIBM staticIbm;
+dfloat freeStreamVelocity = 1.0;
+dfloat cylinderDiameter = 1.0;
+dfloat spanLength = 1.0;
+}
+
+void ibmForcing(double time)
+{
+  staticIbm.applyForcing(time);
+}
+
+void UDF_Setup0(MPI_Comm, setupAide & options)
+{
+  staticIbm.configure(options);
+  platform->par->extract("casedata", "free_stream_velocity", freeStreamVelocity);
+  platform->par->extract("casedata", "cylinder_diameter", cylinderDiameter);
+  platform->par->extract("casedata", "span_length", spanLength);
+
+  int ciMode = 0;
+  options.getArgs("CI-MODE", ciMode);
+  if (ciMode)
+    options.setArgs("END TIME", "0.004");
+}
+
+void UDF_Setup()
+{
+  staticIbm.setup(nrs);
+  nrs->userSource = &ibmForcing;
+
+  if (platform->options.getArgs("RESTART FILE NAME").empty())
+  {
+    auto mesh = nrs->meshV;
+    std::vector<dfloat> velocity(mesh->dim * nrs->fluid->fieldOffset, 0.0);
+    for (dlong n = 0; n < mesh->Nlocal; ++n)
+      velocity[n] = freeStreamVelocity;
+    nrs->fluid->o_U.copyFrom(velocity.data(), velocity.size());
+  }
+}
+
+void UDF_LoadKernels(deviceKernelProperties & kernelInfo)
+{
+  kernelInfo.define("p_blockSize") = 256;
+  kernelInfo.define("p_freeStreamVelocity") = freeStreamVelocity;
+}
+
+void UDF_ExecuteStep(double time, int tstep)
+{
+  if (!nrs->lastStep && !nrs->checkpointStep)
+    return;
+
+  const auto values = staticIbm.diagnostics();
+  const dfloat forceScale =
+      2.0 / (freeStreamVelocity * freeStreamVelocity * cylinderDiameter * spanLength);
+  const dfloat dragCoefficient = -forceScale * values.force[0];
+  const dfloat liftCoefficient = -forceScale * values.force[1];
+
+  if (platform->comm.mpiRank() == 0)
+    printf("cylinderIBM step=%d time=%.8e slipMax=%.8e slipRms=%.8e "
+           "force=(%.8e, %.8e, %.8e) Cd=%.8e Cl=%.8e\n",
+           tstep,
+           time,
+           static_cast<double>(values.maximumSlip),
+           static_cast<double>(values.rmsSlip),
+           static_cast<double>(values.force[0]),
+           static_cast<double>(values.force[1]),
+           static_cast<double>(values.force[2]),
+           static_cast<double>(dragCoefficient),
+           static_cast<double>(liftCoefficient));
+
+  if (nrs->lastStep && staticIbm.ciMode())
+  {
+    const bool finite = std::isfinite(values.maximumSlip) && std::isfinite(values.rmsSlip) &&
+                        std::isfinite(values.force[0]) && std::isfinite(values.force[1]) &&
+                        std::isfinite(values.force[2]);
+    CiEvalTest("periodic cylinder IBM diagnostics are finite", finite);
+    CiEvalTest("periodic cylinder receives nonzero streamwise forcing",
+               std::abs(values.force[0]) > 1e-14 || values.maximumSlip > 1e-14);
+    CiFinalize();
+  }
+}
+
+#endif
