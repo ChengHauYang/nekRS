@@ -1,0 +1,285 @@
+#include "opSEM.hpp"
+
+#ifdef __okl__
+
+void udfDirichlet(bcData * bc)
+{
+  if (isField("FLUID VELOCITY"))
+  {
+    bc->uxFluid = 0.0;
+    bc->uyFluid = 0.0;
+    bc->uzFluid = 0.0;
+  }
+}
+
+#else
+
+#include "ibmGeometry.hpp"
+#include "stl_reader.hpp"
+
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <numeric>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+namespace
+{
+ibm::MarkerSet markers;
+std::string stlFile = "geometry/reference.stl";
+double markerSpacing = 0.40;
+double shellThickness = 0.05;
+int maxSubdivisionDepth = 30;
+int ciMode = 0;
+bool broadcastValidationPassed = false;
+
+void checkMpiCount(const std::size_t count, const char * name, MPI_Comm comm)
+{
+  nekrsCheck(count > static_cast<std::size_t>(INT_MAX),
+             comm,
+             EXIT_FAILURE,
+             "IBM phase1 %s contains %zu entries, exceeding MPI int count\n",
+             name,
+             count);
+}
+
+void broadcastRootError(std::string & message, const int root, MPI_Comm comm)
+{
+  int rank = 0;
+  MPI_Comm_rank(comm, &rank);
+  unsigned long long length =
+      rank == root ? static_cast<unsigned long long>(message.size()) : 0;
+  MPI_Bcast(&length, 1, MPI_UNSIGNED_LONG_LONG, root, comm);
+  nekrsCheck(length > static_cast<unsigned long long>(INT_MAX),
+             comm,
+             EXIT_FAILURE,
+             "IBM phase1 setup error message exceeds MPI count\n");
+  if (rank != root)
+    message.resize(static_cast<std::size_t>(length));
+  if (length)
+    MPI_Bcast(&message[0], static_cast<int>(length), MPI_CHAR, root, comm);
+}
+
+void broadcastMarkerSet(ibm::MarkerSet & values, const int root, MPI_Comm comm)
+{
+  int rank = 0;
+  MPI_Comm_rank(comm, &rank);
+  unsigned long long markerCount =
+      rank == root ? static_cast<unsigned long long>(values.size()) : 0;
+  MPI_Bcast(&markerCount, 1, MPI_UNSIGNED_LONG_LONG, root, comm);
+
+  nekrsCheck(markerCount >
+                     static_cast<unsigned long long>(std::numeric_limits<dlong>::max()) ||
+                 markerCount > std::numeric_limits<std::size_t>::max() / 3,
+             comm,
+             EXIT_FAILURE,
+             "IBM phase1 marker count cannot be represented safely\n");
+
+  const std::size_t count = static_cast<std::size_t>(markerCount);
+  if (rank != root)
+  {
+    values.coordinates.resize(3 * count);
+    values.targetVelocity.resize(3 * count);
+    values.volume.resize(count);
+    values.sourceTriangle.resize(count);
+  }
+
+  checkMpiCount(values.coordinates.size(), "coordinates", comm);
+  checkMpiCount(values.targetVelocity.size(), "target velocities", comm);
+  checkMpiCount(values.volume.size(), "volumes", comm);
+  nekrsCheck(values.sourceTriangle.size() > static_cast<std::size_t>(INT_MAX) / sizeof(dlong),
+             comm,
+             EXIT_FAILURE,
+             "IBM phase1 source-triangle array exceeds MPI int byte count\n");
+
+  MPI_Bcast(values.coordinates.data(),
+            static_cast<int>(values.coordinates.size()),
+            MPI_DFLOAT,
+            root,
+            comm);
+  MPI_Bcast(values.targetVelocity.data(),
+            static_cast<int>(values.targetVelocity.size()),
+            MPI_DFLOAT,
+            root,
+            comm);
+  MPI_Bcast(values.volume.data(),
+            static_cast<int>(values.volume.size()),
+            MPI_DFLOAT,
+            root,
+            comm);
+  MPI_Bcast(values.sourceTriangle.data(),
+            static_cast<int>(values.sourceTriangle.size() * sizeof(dlong)),
+            MPI_BYTE,
+            root,
+            comm);
+}
+
+std::uint64_t fnv1aAppend(std::uint64_t hash, const void * data, const std::size_t bytes)
+{
+  const auto * values = static_cast<const unsigned char *>(data);
+  for (std::size_t index = 0; index < bytes; ++index)
+  {
+    hash ^= values[index];
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+template <typename T>
+std::uint64_t fnv1aVector(std::uint64_t hash, const std::vector<T> & values)
+{
+  return fnv1aAppend(hash, values.data(), values.size() * sizeof(T));
+}
+
+std::uint64_t markerHash(const ibm::MarkerSet & values)
+{
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  const std::uint64_t count = values.size();
+  hash = fnv1aAppend(hash, &count, sizeof(count));
+  hash = fnv1aVector(hash, values.coordinates);
+  hash = fnv1aVector(hash, values.targetVelocity);
+  hash = fnv1aVector(hash, values.volume);
+  return fnv1aVector(hash, values.sourceTriangle);
+}
+
+void validateBroadcastResult(const ibm::MarkerSet & values, MPI_Comm comm)
+{
+  const std::size_t count = values.size();
+  bool localValid = count > 0 && values.coordinates.size() == 3 * count &&
+                    values.targetVelocity.size() == 3 * count &&
+                    values.sourceTriangle.size() == count;
+  for (std::size_t marker = 0; marker < count && localValid; ++marker)
+  {
+    localValid &= std::isfinite(values.volume[marker]) && values.volume[marker] > 0;
+    localValid &= values.sourceTriangle[marker] >= 0;
+    for (unsigned int component = 0; component < 3; ++component)
+    {
+      localValid &= std::isfinite(values.coordinates[marker + component * count]);
+      localValid &= std::isfinite(values.targetVelocity[marker + component * count]);
+    }
+  }
+
+  int valid = localValid ? 1 : 0;
+  int allValid = 0;
+  MPI_Allreduce(&valid, &allValid, 1, MPI_INT, MPI_MIN, comm);
+  nekrsCheck(!allValid,
+             comm,
+             EXIT_FAILURE,
+             "IBM phase1 received an invalid marker array on at least one rank\n");
+
+  const unsigned long long localHash = static_cast<unsigned long long>(markerHash(values));
+  unsigned long long minimumHash = 0;
+  unsigned long long maximumHash = 0;
+  MPI_Allreduce(&localHash, &minimumHash, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm);
+  MPI_Allreduce(&localHash, &maximumHash, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, comm);
+  nekrsCheck(minimumHash != maximumHash,
+             comm,
+             EXIT_FAILURE,
+             "IBM phase1 marker arrays differ across MPI ranks\n");
+  broadcastValidationPassed = true;
+}
+} // namespace
+
+void UDF_Setup0(MPI_Comm comm, setupAide & options)
+{
+  (void)comm;
+  platform->par->extract("casedata", "stl_file", stlFile);
+  platform->par->extract("casedata", "marker_spacing", markerSpacing);
+  platform->par->extract("casedata", "shell_thickness", shellThickness);
+  platform->par->extract("casedata", "max_subdivision_depth", maxSubdivisionDepth);
+  options.getArgs("CI-MODE", ciMode);
+
+  // The refined CI mode uses the same independent parameter at half its value.
+  if (ciMode == 2)
+    markerSpacing *= 0.5;
+}
+
+void UDF_Setup()
+{
+  MPI_Comm comm = platform->comm.mpiComm();
+  const int rank = platform->comm.mpiRank();
+  std::string setupError;
+  std::vector<ibm::Triangle> triangles;
+  ibm::SamplingStatistics statistics;
+
+  if (rank == 0)
+  {
+    try
+    {
+      if (maxSubdivisionDepth < 0)
+        throw std::invalid_argument("max_subdivision_depth must be non-negative");
+      triangles = ibm::readBinaryStl(stlFile);
+      markers = ibm::sampleStaticSurface(triangles,
+                                         markerSpacing,
+                                         shellThickness,
+                                         static_cast<unsigned int>(maxSubdivisionDepth),
+                                         &statistics);
+      ibm::validateMarkers(triangles, markers, shellThickness);
+    }
+    catch (const std::exception & error)
+    {
+      setupError = error.what();
+    }
+  }
+
+  broadcastRootError(setupError, 0, comm);
+  nekrsCheck(!setupError.empty(),
+             comm,
+             EXIT_FAILURE,
+             "IBM phase1 geometry setup failed: %s\n",
+             setupError.c_str());
+  broadcastMarkerSet(markers, 0, comm);
+  validateBroadcastResult(markers, comm);
+
+  if (rank == 0)
+  {
+    const double totalArea = std::accumulate(
+        triangles.begin(), triangles.end(), 0.0,
+        [](const double sum, const ibm::Triangle & triangle) {
+          return sum + ibm::triangleArea(triangle);
+        });
+    const auto volumeRange = std::minmax_element(markers.volume.begin(), markers.volume.end());
+    const double markerVolume =
+        std::accumulate(markers.volume.begin(), markers.volume.end(), 0.0);
+    printf("IBM phase1: triangles=%zu markers=%zu ranks=%d ell_marker=%.8e h=%.8e "
+           "area=%.16e markerVolume=%.16e dVp=[%.8e, %.8e] leafMaxEdge=[%.8e, %.8e]\n",
+           triangles.size(),
+           markers.size(),
+           platform->comm.mpiCommSize(),
+           markerSpacing,
+           shellThickness,
+           totalArea,
+           markerVolume,
+           static_cast<double>(*volumeRange.first),
+           static_cast<double>(*volumeRange.second),
+           statistics.minimumLeafMaxEdge,
+           statistics.maximumLeafMaxEdge);
+  }
+}
+
+void UDF_ExecuteStep(double time, int tstep)
+{
+  (void)time;
+  (void)tstep;
+  if (!nrs->lastStep || ciMode == 0)
+    return;
+
+  const std::size_t expectedCount = ciMode == 1 ? 16 : (ciMode == 2 ? 64 : markers.size());
+  CiEvalTest("IBM phase1 marker arrays are finite and identical on every rank",
+             broadcastValidationPassed);
+  CiEvalTest("IBM phase1 deterministic reference marker count (" +
+                 std::to_string(markers.size()) + ")",
+             markers.size() == expectedCount);
+  CiEvalTest("IBM phase1 marker volumes are positive",
+             std::all_of(markers.volume.begin(), markers.volume.end(),
+                         [](const dfloat value) { return std::isfinite(value) && value > 0; }));
+  CiFinalize();
+}
+
+#endif

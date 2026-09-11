@@ -120,6 +120,12 @@ add("ibmSourceResponse" 2 "ibmSourceResponse.par" "1;2;3;4;5;6" "${USE_FP32}" "$
 add("ibmSourceResponseSerial" 1 "ibmSourceResponse.par" "1;6" "${USE_FP32}"
     "${EXAMPLES_DIR}/ibmSourceResponse" "${BUILD_ONLY}")
 
+# Add beside the existing ibmSourceResponse registrations in examples/CMakeLists.txt.
+add("staticIBMSerial" 1 "staticIBM.par" "1;2" "${USE_FP32}"
+    "${EXAMPLES_DIR}/staticIBM" "${BUILD_ONLY}")
+add("staticIBM" 2 "staticIBM.par" "1;2" "${USE_FP32}"
+    "${EXAMPLES_DIR}/staticIBM" "${BUILD_ONLY}")
+
 add("lowMach" 2 "lowMach.par" "1" "${USE_FP32}" "${dir}" "${BUILD_ONLY}")
 
 add("mv_cyl" 2 "mv_cyl.par" "1;2;3;5;6" "${USE_FP32}" "${dir}" "${BUILD_ONLY}")

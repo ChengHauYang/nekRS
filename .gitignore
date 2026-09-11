@@ -12,3 +12,7 @@ logfile
 *.dat
 .cache/
 .plans/
+
+.DS_Store
+
+*build*
