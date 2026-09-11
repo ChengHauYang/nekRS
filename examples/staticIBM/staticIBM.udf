@@ -12,10 +12,71 @@ void udfDirichlet(bcData * bc)
   }
 }
 
+@kernel void ibm_interpolate(const dlong Np,
+                             const dlong fieldOffset,
+                             @restrict const dlong *interp_offsets,
+                             @restrict const dlong *interp_indices,
+                             @restrict const dfloat *interp_weights,
+                             @restrict const dfloat *U_fluid,
+                             @restrict dfloat *redux)
+{
+  for (dlong p = 0; p < Np; ++p; @tile(p_blockSize, @outer, @inner)) {
+    dfloat vx = 0, vy = 0, vz = 0;
+    for (dlong i = interp_offsets[p]; i < interp_offsets[p + 1]; ++i) {
+      const dlong n = interp_indices[i];
+      const dfloat w = interp_weights[i];
+      vx += w * U_fluid[n + 0 * fieldOffset];
+      vy += w * U_fluid[n + 1 * fieldOffset];
+      vz += w * U_fluid[n + 2 * fieldOffset];
+    }
+    redux[p + 0 * Np] = vx;
+    redux[p + 1 * Np] = vy;
+    redux[p + 2 * Np] = vz;
+  }
+}
+
+@kernel void ibm_compute_feedback(const dlong Np,
+                                  const dfloat gainOverDt,
+                                  @restrict const dfloat *velocity,
+                                  @restrict const dfloat *Vtarget,
+                                  @restrict dfloat *acceleration)
+{
+  for (dlong p = 0; p < Np; ++p; @tile(p_blockSize, @outer, @inner)) {
+    acceleration[p + 0 * Np] = gainOverDt * (Vtarget[p + 0 * Np] - velocity[p + 0 * Np]);
+    acceleration[p + 1 * Np] = gainOverDt * (Vtarget[p + 1 * Np] - velocity[p + 1 * Np]);
+    acceleration[p + 2 * Np] = gainOverDt * (Vtarget[p + 2 * Np] - velocity[p + 2 * Np]);
+  }
+}
+
+@kernel void ibm_spread(const dlong Nlocal,
+                        const dlong Np,
+                        const dlong fieldOffset,
+                        @restrict const dlong *spread_offsets,
+                        @restrict const dlong *spread_indices,
+                        @restrict const dfloat *spread_weights,
+                        @restrict const dfloat *acceleration,
+                        @restrict dfloat *explicitTerms)
+{
+  for (dlong n = 0; n < Nlocal; ++n; @tile(p_blockSize, @outer, @inner)) {
+    dfloat ax = 0, ay = 0, az = 0;
+    for (dlong i = spread_offsets[n]; i < spread_offsets[n + 1]; ++i) {
+      const dlong p = spread_indices[i];
+      const dfloat w = spread_weights[i];
+      ax += w * acceleration[p + 0 * Np];
+      ay += w * acceleration[p + 1 * Np];
+      az += w * acceleration[p + 2 * Np];
+    }
+    explicitTerms[n + 0 * fieldOffset] += ax;
+    explicitTerms[n + 1 * fieldOffset] += ay;
+    explicitTerms[n + 2 * fieldOffset] += az;
+  }
+}
+
 #else
 
 #include "ibmGeometry.hpp"
 #include "stl_reader.hpp"
+#include "ibmInteraction.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -39,6 +100,21 @@ int maxSubdivisionDepth = 30;
 int ciMode = 0;
 bool broadcastValidationPassed = false;
 
+double supportRadius = 0.5;
+double gaussianWidth = 0.25;
+
+static occa::memory o_interp_offsets, o_interp_indices;
+static occa::memory o_interp_weights;
+static occa::memory o_spread_offsets, o_spread_indices;
+static occa::memory o_spread_weights;
+
+static dlong N_particles;
+static occa::memory o_Vtarget;
+static occa::memory o_markerAcceleration;
+static occa::memory o_redux;
+static std::vector<dfloat> h_redux;
+
+
 void checkMpiCount(const std::size_t count, const char * name, MPI_Comm comm)
 {
   nekrsCheck(count > static_cast<std::size_t>(INT_MAX),
@@ -59,7 +135,7 @@ void broadcastRootError(std::string & message, const int root, MPI_Comm comm)
   nekrsCheck(length > static_cast<unsigned long long>(INT_MAX),
              comm,
              EXIT_FAILURE,
-             "IBM phase1 setup error message exceeds MPI count\n");
+             "%s", "IBM phase1 setup error message exceeds MPI count\n");
   if (rank != root)
     message.resize(static_cast<std::size_t>(length));
   if (length)
@@ -79,7 +155,7 @@ void broadcastMarkerSet(ibm::MarkerSet & values, const int root, MPI_Comm comm)
                  markerCount > std::numeric_limits<std::size_t>::max() / 3,
              comm,
              EXIT_FAILURE,
-             "IBM phase1 marker count cannot be represented safely\n");
+             "%s", "IBM phase1 marker count cannot be represented safely\n");
 
   const std::size_t count = static_cast<std::size_t>(markerCount);
   if (rank != root)
@@ -96,7 +172,7 @@ void broadcastMarkerSet(ibm::MarkerSet & values, const int root, MPI_Comm comm)
   nekrsCheck(values.sourceTriangle.size() > static_cast<std::size_t>(INT_MAX) / sizeof(dlong),
              comm,
              EXIT_FAILURE,
-             "IBM phase1 source-triangle array exceeds MPI int byte count\n");
+             "%s", "IBM phase1 source-triangle array exceeds MPI int byte count\n");
 
   MPI_Bcast(values.coordinates.data(),
             static_cast<int>(values.coordinates.size()),
@@ -171,7 +247,7 @@ void validateBroadcastResult(const ibm::MarkerSet & values, MPI_Comm comm)
   nekrsCheck(!allValid,
              comm,
              EXIT_FAILURE,
-             "IBM phase1 received an invalid marker array on at least one rank\n");
+             "%s", "IBM phase1 received an invalid marker array on at least one rank\n");
 
   const unsigned long long localHash = static_cast<unsigned long long>(markerHash(values));
   unsigned long long minimumHash = 0;
@@ -181,7 +257,7 @@ void validateBroadcastResult(const ibm::MarkerSet & values, MPI_Comm comm)
   nekrsCheck(minimumHash != maximumHash,
              comm,
              EXIT_FAILURE,
-             "IBM phase1 marker arrays differ across MPI ranks\n");
+             "%s", "IBM phase1 marker arrays differ across MPI ranks\n");
   broadcastValidationPassed = true;
 }
 } // namespace
@@ -199,6 +275,8 @@ void UDF_Setup0(MPI_Comm comm, setupAide & options)
   if (ciMode == 2)
     markerSpacing *= 0.5;
 }
+
+void ibm_forcing(double time);
 
 void UDF_Setup()
 {
@@ -261,6 +339,88 @@ void UDF_Setup()
            statistics.minimumLeafMaxEdge,
            statistics.maximumLeafMaxEdge);
   }
+
+  // --- Phase 2: Interaction Precomputation ---
+  auto mesh = nrs->meshV;
+  std::vector<dfloat> node_x(mesh->Nlocal);
+  std::vector<dfloat> node_y(mesh->Nlocal);
+  std::vector<dfloat> node_z(mesh->Nlocal);
+  std::vector<dfloat> node_jw(mesh->Nlocal);
+
+  if (mesh->Nlocal > 0) {
+    mesh->o_x.copyTo(node_x.data(), mesh->Nlocal);
+    mesh->o_y.copyTo(node_y.data(), mesh->Nlocal);
+    mesh->o_z.copyTo(node_z.data(), mesh->Nlocal);
+    mesh->o_Jw.copyTo(node_jw.data(), mesh->Nlocal);
+  }
+
+  ibm::InteractionMaps maps = ibm::buildInteractionMaps(
+    markers, node_x, node_y, node_z, node_jw, supportRadius, gaussianWidth, comm);
+
+  N_particles = markers.size();
+  h_redux.resize(3 * N_particles, 0.0);
+
+  // Allocate device memory and copy
+  o_interp_offsets = platform->device.malloc<dlong>(maps.interp.offsets.size(), maps.interp.offsets.data());
+  o_interp_indices = platform->device.malloc<dlong>(maps.interp.indices.size(), maps.interp.indices.data());
+  o_interp_weights = platform->device.malloc<dfloat>(maps.interp.weights.size(), maps.interp.weights.data());
+
+  o_spread_offsets = platform->device.malloc<dlong>(maps.spread.offsets.size(), maps.spread.offsets.data());
+  o_spread_indices = platform->device.malloc<dlong>(maps.spread.indices.size(), maps.spread.indices.data());
+  o_spread_weights = platform->device.malloc<dfloat>(maps.spread.weights.size(), maps.spread.weights.data());
+
+  if (markers.targetVelocity.size() > 0) {
+    o_Vtarget = platform->device.malloc<dfloat>(markers.targetVelocity.size(), markers.targetVelocity.data());
+    o_markerAcceleration = platform->device.malloc<dfloat>(markers.targetVelocity.size());
+    o_redux = platform->device.malloc<dfloat>(3 * N_particles);
+  }
+
+  nrs->userSource = &ibm_forcing;
+}
+
+void ibm_forcing(double time)
+{
+  if (N_particles == 0) return;
+  auto mesh = nrs->meshV;
+  const dlong Np = N_particles;
+
+  ibm_interpolate(Np,
+                  nrs->fluid->fieldOffset,
+                  o_interp_offsets,
+                  o_interp_indices,
+                  o_interp_weights,
+                  nrs->fluid->o_U,
+                  o_redux);
+
+  o_redux.copyTo(h_redux.data(), 3 * Np);
+  MPI_Allreduce(MPI_IN_PLACE,
+                h_redux.data(),
+                3 * Np,
+                MPI_DFLOAT,
+                MPI_SUM,
+                platform->comm.mpiComm());
+  o_redux.copyFrom(h_redux.data(), 3 * Np);
+
+  const dfloat gainOverDt = 1.0 / nrs->dt[0];
+  ibm_compute_feedback(Np,
+                       gainOverDt,
+                       o_redux,
+                       o_Vtarget,
+                       o_markerAcceleration);
+
+  ibm_spread(mesh->Nlocal,
+             Np,
+             nrs->fluid->fieldOffset,
+             o_spread_offsets,
+             o_spread_indices,
+             o_spread_weights,
+             o_markerAcceleration,
+             nrs->fluid->o_explicitTerms());
+}
+
+void UDF_LoadKernels(deviceKernelProperties& kernelInfo)
+{
+  kernelInfo.define("p_blockSize") = 256;
 }
 
 void UDF_ExecuteStep(double time, int tstep)
