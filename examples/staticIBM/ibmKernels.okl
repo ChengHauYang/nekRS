@@ -1,0 +1,59 @@
+@kernel void ibm_interpolate(const dlong Np,
+                             const dlong fieldOffset,
+                             @restrict const dlong *interp_offsets,
+                             @restrict const dlong *interp_indices,
+                             @restrict const dfloat *interp_weights,
+                             @restrict const dfloat *U_fluid,
+                             @restrict dfloat *redux)
+{
+  for (dlong p = 0; p < Np; ++p; @tile(p_blockSize, @outer, @inner)) {
+    dfloat vx = 0, vy = 0, vz = 0;
+    for (dlong i = interp_offsets[p]; i < interp_offsets[p + 1]; ++i) {
+      const dlong n = interp_indices[i];
+      const dfloat w = interp_weights[i];
+      vx += w * U_fluid[n + 0 * fieldOffset];
+      vy += w * U_fluid[n + 1 * fieldOffset];
+      vz += w * U_fluid[n + 2 * fieldOffset];
+    }
+    redux[p + 0 * Np] = vx;
+    redux[p + 1 * Np] = vy;
+    redux[p + 2 * Np] = vz;
+  }
+}
+
+@kernel void ibm_compute_feedback(const dlong Np,
+                                  const dfloat gainOverDt,
+                                  @restrict const dfloat *velocity,
+                                  @restrict const dfloat *Vtarget,
+                                  @restrict dfloat *acceleration)
+{
+  for (dlong p = 0; p < Np; ++p; @tile(p_blockSize, @outer, @inner)) {
+    acceleration[p + 0 * Np] = gainOverDt * (Vtarget[p + 0 * Np] - velocity[p + 0 * Np]);
+    acceleration[p + 1 * Np] = gainOverDt * (Vtarget[p + 1 * Np] - velocity[p + 1 * Np]);
+    acceleration[p + 2 * Np] = gainOverDt * (Vtarget[p + 2 * Np] - velocity[p + 2 * Np]);
+  }
+}
+
+@kernel void ibm_spread(const dlong Nlocal,
+                        const dlong Np,
+                        const dlong fieldOffset,
+                        @restrict const dlong *spread_offsets,
+                        @restrict const dlong *spread_indices,
+                        @restrict const dfloat *spread_weights,
+                        @restrict const dfloat *acceleration,
+                        @restrict dfloat *explicitTerms)
+{
+  for (dlong n = 0; n < Nlocal; ++n; @tile(p_blockSize, @outer, @inner)) {
+    dfloat ax = 0, ay = 0, az = 0;
+    for (dlong i = spread_offsets[n]; i < spread_offsets[n + 1]; ++i) {
+      const dlong p = spread_indices[i];
+      const dfloat w = spread_weights[i];
+      ax += w * acceleration[p + 0 * Np];
+      ay += w * acceleration[p + 1 * Np];
+      az += w * acceleration[p + 2 * Np];
+    }
+    explicitTerms[n + 0 * fieldOffset] += ax;
+    explicitTerms[n + 1 * fieldOffset] += ay;
+    explicitTerms[n + 2 * fieldOffset] += az;
+  }
+}

@@ -126,6 +126,11 @@ add("staticIBMSerial" 1 "staticIBM.par" "1;2" "${USE_FP32}"
 add("staticIBM" 2 "staticIBM.par" "1;2" "${USE_FP32}"
     "${EXAMPLES_DIR}/staticIBM" "${BUILD_ONLY}")
 
+add("sphereIBMSerial" 1 "sphereIBM.par" "1" "${USE_FP32}"
+    "${EXAMPLES_DIR}/sphereIBM" "${BUILD_ONLY}")
+add("sphereIBM" 2 "sphereIBM.par" "1" "${USE_FP32}"
+    "${EXAMPLES_DIR}/sphereIBM" "${BUILD_ONLY}")
+
 add("lowMach" 2 "lowMach.par" "1" "${USE_FP32}" "${dir}" "${BUILD_ONLY}")
 
 add("mv_cyl" 2 "mv_cyl.par" "1;2;3;5;6" "${USE_FP32}" "${dir}" "${BUILD_ONLY}")

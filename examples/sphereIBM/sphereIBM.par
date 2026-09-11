@@ -2,30 +2,32 @@ userSections = CASEDATA
 
 [GENERAL]
 polynomialOrder = 5
-stopAt = numSteps
-numSteps = 1
-dt = 2e-3
+stopAt = endTime
+endTime = 10.0
+dt = 1e-3
 timeStepper = tombo3
-checkpointInterval = 0
+checkpointControl = simulationTime
+checkpointInterval = 1.0
 
 [PROBLEMTYPE]
-equation = stokes
+equation = navierStokes
 
 [FLUID PRESSURE]
 residualTol = 1e-08
 solver = cg+flexible
 smootherType = Jac+Cheby
+initialGuess = previous
 
 [FLUID VELOCITY]
 boundaryTypeMap = udfDirichlet
 residualTol = 1e-10
 rho = 1.0
-viscosity = 0.02
+viscosity = 0.01
 
 [CASEDATA]
-stl_file = geometry/reference.stl
-marker_spacing = 0.40
-shell_thickness = 0.05
-support_radius = 0.50
-gaussian_width = 0.25
+stl_file = geometry/sphere_r025.stl
+marker_spacing = 0.04
+shell_thickness = 0.04
+support_radius = 0.08
+gaussian_width = 0.04
 max_subdivision_depth = 30
