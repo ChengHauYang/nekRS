@@ -13,11 +13,11 @@ void udfDirichlet(bcData * bc)
   }
 }
 
-#include "../staticIBM/ibmKernels.okl"
+#include "ibm/ibmKernels.okl"
 
 #else
 
-#include "../staticIBM/staticSurfaceIBM.hpp"
+#include "ibm/staticSurfaceIBM.hpp"
 
 #include <cmath>
 #include <cstdio>

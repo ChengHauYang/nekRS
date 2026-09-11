@@ -7,8 +7,8 @@ using dfloat = double;
 #endif
 using dlong = std::int64_t;
 
-#include "../ibmGeometry.hpp"
-#include "../stl_reader.hpp"
+#include "../../../src/ibm/ibmGeometry.hpp"
+#include "../../../src/ibm/stl_reader.hpp"
 
 #include <cassert>
 #include <cmath>

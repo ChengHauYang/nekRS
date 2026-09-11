@@ -20,6 +20,7 @@ occa::properties registerUDFKernels()
   const std::string bcDataFile = installDir + "/include/app/nrs/bdry/bcData.h";
   kernelInfo.include() += bcDataFile.c_str();
   kernelInfo.okl_include_paths() += std::string(fs::current_path()).c_str();
+  kernelInfo.okl_include_paths() += (installDir + "/kernels").c_str();
 
   if (udf.loadKernels) {
     udf.loadKernels(kernelInfo);

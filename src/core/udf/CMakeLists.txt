@@ -45,11 +45,12 @@ set(INCLUDE_DIRS
   ${NEKRS_INSTALL_DIR}/include/app/nrs/bdry
   ${NEKRS_INSTALL_DIR}/include/app/nrs/plugins
   ${NEKRS_INSTALL_DIR}/include/app/nrs/postProcessing
+  ${NEKRS_INSTALL_DIR}/include/ibm
 )
 
 # dummy
 add_library(OKL EXCLUDE_FROM_ALL okl.cpp)
-target_include_directories(OKL PRIVATE $ENV{NEKRS_UDF_INCLUDES} ${INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(OKL PRIVATE $ENV{NEKRS_UDF_INCLUDES} ${INCLUDE_DIRS} ${NEKRS_INSTALL_DIR}/kernels ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(OKL PRIVATE __okl__)
 
 add_library(udf SHARED udf.cpp)

@@ -38,6 +38,7 @@ public:
     platform->par->extract("casedata", "support_radius", _supportRadius);
     platform->par->extract("casedata", "gaussian_width", _gaussianWidth);
     platform->par->extract("casedata", "max_subdivision_depth", _maxSubdivisionDepth);
+    platform->par->extract("casedata", "periodic_dimensions", _periodicDimensions);
     options.getArgs("CI-MODE", _ciMode);
 
     if (_ciMode == 2)
@@ -354,6 +355,8 @@ private:
       mesh->o_Jw.copyTo(jw.data(), mesh->Nlocal);
     }
 
+    checkPeriodicBoundaryExclusion(_markers, x, y, z, _supportRadius, _periodicDimensions, comm);
+
     _maps = buildInteractionMaps(
         _markers, x, y, z, jw, _supportRadius, _gaussianWidth, comm);
 
@@ -399,6 +402,7 @@ private:
   double _supportRadius = 0.5;
   double _gaussianWidth = 0.25;
   int _maxSubdivisionDepth = 30;
+  std::string _periodicDimensions = "none";
   int _ciMode = 0;
   bool _broadcastValidationPassed = false;
 

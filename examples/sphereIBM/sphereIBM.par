@@ -31,3 +31,4 @@ shell_thickness = 0.04
 support_radius = 0.08
 gaussian_width = 0.04
 max_subdivision_depth = 30
+periodic_dimensions = none

@@ -12,14 +12,15 @@ void udfDirichlet(bcData * bc)
   }
 }
 
-#include "ibmKernels.okl"
+#include "ibm/ibmKernels.okl"
 
 #else
 
-#include "staticSurfaceIBM.hpp"
+#include "ibm/staticSurfaceIBM.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <string>
 
 namespace
@@ -48,9 +49,24 @@ void UDF_LoadKernels(deviceKernelProperties & kernelInfo)
   kernelInfo.define("p_blockSize") = 256;
 }
 
-void UDF_ExecuteStep(double, int)
+void UDF_ExecuteStep(double time, int tstep)
 {
-  if (!nrs->lastStep || staticIbm.ciMode() == 0)
+  if (!nrs->lastStep)
+    return;
+
+  const auto values = staticIbm.diagnostics();
+  if (platform->comm.mpiRank() == 0)
+    printf("staticIBM step=%d time=%.8e slipMax=%.8e slipRms=%.8e "
+           "force=(%.8e, %.8e, %.8e)\n",
+           tstep,
+           time,
+           static_cast<double>(values.maximumSlip),
+           static_cast<double>(values.rmsSlip),
+           static_cast<double>(values.force[0]),
+           static_cast<double>(values.force[1]),
+           static_cast<double>(values.force[2]));
+
+  if (staticIbm.ciMode() == 0)
     return;
 
   const auto & markers = staticIbm.markers();
