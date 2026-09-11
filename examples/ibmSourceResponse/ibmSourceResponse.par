@@ -1,0 +1,32 @@
+userSections = CASEDATA
+
+[GENERAL]
+polynomialOrder = 5
+stopAt = numSteps
+numSteps = 5
+dt = 2e-3
+timeStepper = tombo3
+checkpointInterval = 0
+
+[PROBLEMTYPE]
+equation = stokes
+
+[FLUID PRESSURE]
+residualTol = 1e-08
+solver = cg+flexible
+smootherType = Jac+Cheby
+
+[FLUID VELOCITY]
+boundaryTypeMap = udfDirichlet
+residualTol = 1e-10
+rho = 2.0
+viscosity = 0.02
+
+[CASEDATA]
+feedback_gain = 1.0
+target_ux = 1.0
+target_uy = 0.0
+target_uz = 0.0
+source_ax = 0.25
+source_ay = -0.125
+source_az = 0.0625

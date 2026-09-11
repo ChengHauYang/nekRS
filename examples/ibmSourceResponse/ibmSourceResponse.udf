@@ -1,0 +1,531 @@
+#include "opSEM.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <limits>
+#include <numeric>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+#ifdef __okl__
+
+void udfDirichlet(bcData *bc)
+{
+  if (isField("FLUID VELOCITY")) {
+    bc->uxFluid = p_sourceAx * bc->time;
+    bc->uyFluid = p_sourceAy * bc->time;
+    bc->uzFluid = p_sourceAz * bc->time;
+  }
+}
+
+@kernel void ibm_interpolate(const dlong Np,
+                             const dlong fieldOffset,
+                             @ restrict const dlong *interpOffsets,
+                             @ restrict const dlong *interpIndices,
+                             @ restrict const dfloat *interpWeights,
+                             @ restrict const dfloat *velocity,
+                             @ restrict dfloat *markerVelocity)
+{
+  for (dlong p = 0; p < Np; ++p; @tile(p_blockSize, @outer, @inner)) {
+    dfloat vx = 0.0;
+    dfloat vy = 0.0;
+    dfloat vz = 0.0;
+    for (dlong i = interpOffsets[p]; i < interpOffsets[p + 1]; ++i) {
+      const dlong n = interpIndices[i];
+      const dfloat weight = interpWeights[i];
+      vx += weight * velocity[n + 0 * fieldOffset];
+      vy += weight * velocity[n + 1 * fieldOffset];
+      vz += weight * velocity[n + 2 * fieldOffset];
+    }
+    markerVelocity[p + 0 * Np] = vx;
+    markerVelocity[p + 1 * Np] = vy;
+    markerVelocity[p + 2 * Np] = vz;
+  }
+}
+
+@kernel void ibm_constant_source(const dlong Nlocal,
+                                 const dlong fieldOffset,
+                                 const dfloat ax,
+                                 const dfloat ay,
+                                 const dfloat az,
+                                 @ restrict dfloat *explicitTerms)
+{
+  for (dlong n = 0; n < Nlocal; ++n; @tile(p_blockSize, @outer, @inner)) {
+    explicitTerms[n + 0 * fieldOffset] += ax;
+    explicitTerms[n + 1 * fieldOffset] += ay;
+    explicitTerms[n + 2 * fieldOffset] += az;
+  }
+}
+
+@kernel void ibm_velocity_error(const dlong Nlocal,
+                                const dlong fieldOffset,
+                                const dfloat expectedUx,
+                                const dfloat expectedUy,
+                                const dfloat expectedUz,
+                                @ restrict const dfloat *velocity,
+                                @ restrict dfloat *errorMagnitude)
+{
+  for (dlong n = 0; n < Nlocal; ++n; @tile(p_blockSize, @outer, @inner)) {
+    const dfloat ex = velocity[n + 0 * fieldOffset] - expectedUx;
+    const dfloat ey = velocity[n + 1 * fieldOffset] - expectedUy;
+    const dfloat ez = velocity[n + 2 * fieldOffset] - expectedUz;
+    errorMagnitude[n] = sqrt(ex * ex + ey * ey + ez * ez);
+  }
+}
+
+@kernel void ibm_compute_feedback(const dlong Np,
+                                  const dfloat gainOverDt,
+                                  @ restrict const dfloat *markerVelocity,
+                                  @ restrict const dfloat *targetVelocity,
+                                  @ restrict dfloat *markerAcceleration)
+{
+  for (dlong p = 0; p < Np; ++p; @tile(p_blockSize, @outer, @inner)) {
+    markerAcceleration[p + 0 * Np] =
+        gainOverDt * (targetVelocity[p + 0 * Np] - markerVelocity[p + 0 * Np]);
+    markerAcceleration[p + 1 * Np] =
+        gainOverDt * (targetVelocity[p + 1 * Np] - markerVelocity[p + 1 * Np]);
+    markerAcceleration[p + 2 * Np] =
+        gainOverDt * (targetVelocity[p + 2 * Np] - markerVelocity[p + 2 * Np]);
+  }
+}
+
+@kernel void ibm_spread(const dlong Nlocal,
+                        const dlong Np,
+                        const dlong fieldOffset,
+                        @ restrict const dlong *spreadOffsets,
+                        @ restrict const dlong *spreadIndices,
+                        @ restrict const dfloat *spreadWeights,
+                        @ restrict const dfloat *markerAcceleration,
+                        @ restrict dfloat *explicitTerms)
+{
+  for (dlong n = 0; n < Nlocal; ++n; @tile(p_blockSize, @outer, @inner)) {
+    dfloat ax = 0.0;
+    dfloat ay = 0.0;
+    dfloat az = 0.0;
+    for (dlong i = spreadOffsets[n]; i < spreadOffsets[n + 1]; ++i) {
+      const dlong p = spreadIndices[i];
+      const dfloat weight = spreadWeights[i];
+      ax += weight * markerAcceleration[p + 0 * Np];
+      ay += weight * markerAcceleration[p + 1 * Np];
+      az += weight * markerAcceleration[p + 2 * Np];
+    }
+    explicitTerms[n + 0 * fieldOffset] += ax;
+    explicitTerms[n + 1 * fieldOffset] += ay;
+    explicitTerms[n + 2 * fieldOffset] += az;
+  }
+}
+
+#endif
+
+namespace
+{
+constexpr dlong Nmarkers = 1;
+
+static int ciMode = 0;
+static bool constantSourceMode = false;
+static bool variableDtMode = false;
+static bool coefficientsValid = true;
+static bool timestepSequenceValid = true;
+static bool feedbackResponded = false;
+static dfloat feedbackGain = 1.0;
+static dfloat initialDt = 0.0;
+static dfloat globalVolume = 0.0;
+static dfloat maxCallbackError = 0.0;
+static dfloat maxResponseError = 0.0;
+static dfloat maxDivergence = 0.0;
+static std::array<dfloat, 3> targetVelocity = {1.0, 0.0, 0.0};
+static std::array<dfloat, 3> sourceAcceleration = {0.25, -0.125, 0.0625};
+static std::array<dfloat, 3> callbackVelocity = {0.0, 0.0, 0.0};
+
+static deviceMemory<dlong> o_interpOffsets;
+static deviceMemory<dlong> o_interpIndices;
+static deviceMemory<dfloat> o_interpWeights;
+static deviceMemory<dlong> o_spreadOffsets;
+static deviceMemory<dlong> o_spreadIndices;
+static deviceMemory<dfloat> o_spreadWeights;
+static deviceMemory<dfloat> o_targetVelocity;
+static deviceMemory<dfloat> o_markerVelocity;
+static deviceMemory<dfloat> o_markerAcceleration;
+static deviceMemory<dfloat> o_velocityError;
+
+void interpolateMarker(const occa::memory& o_velocity,
+                       std::array<dfloat, 3>& velocity)
+{
+  ibm_interpolate(Nmarkers,
+                  nrs->fluid->fieldOffset,
+                  o_interpOffsets,
+                  o_interpIndices,
+                  o_interpWeights,
+                  o_velocity,
+                  o_markerVelocity);
+  std::vector<dfloat> reducedVelocity(3 * Nmarkers);
+  o_markerVelocity.copyTo(reducedVelocity);
+  MPI_Allreduce(MPI_IN_PLACE,
+                reducedVelocity.data(),
+                static_cast<int>(reducedVelocity.size()),
+                MPI_DFLOAT,
+                MPI_SUM,
+                platform->comm.mpiComm());
+  std::copy(reducedVelocity.begin(), reducedVelocity.end(), velocity.begin());
+  o_markerVelocity.copyFrom(reducedVelocity);
+}
+
+void ibmForcing(double time)
+{
+  (void)time;
+  interpolateMarker(nrs->fluid->o_U, callbackVelocity);
+
+  if (constantSourceMode) {
+    ibm_constant_source(nrs->meshV->Nlocal,
+                        nrs->fluid->fieldOffset,
+                        sourceAcceleration[0],
+                        sourceAcceleration[1],
+                        sourceAcceleration[2],
+                        nrs->fluid->o_explicitTerms());
+    return;
+  }
+
+  ibm_compute_feedback(Nmarkers,
+                       feedbackGain / nrs->dt[0],
+                       o_markerVelocity,
+                       o_targetVelocity,
+                       o_markerAcceleration);
+
+  ibm_spread(nrs->meshV->Nlocal,
+             Nmarkers,
+             nrs->fluid->fieldOffset,
+             o_spreadOffsets,
+             o_spreadIndices,
+             o_spreadWeights,
+             o_markerAcceleration,
+             nrs->fluid->o_explicitTerms());
+}
+
+void checkAndPrintCoefficients(int tstep)
+{
+  std::vector<dfloat> bdf(nrs->fluid->o_coeffBDF.size());
+  std::vector<dfloat> ext(nrs->fluid->o_coeffEXT.size());
+  nrs->fluid->o_coeffBDF.copyTo(bdf.data());
+  nrs->fluid->o_coeffEXT.copyTo(ext.data());
+
+  const int activeBdf = std::min(tstep, static_cast<int>(bdf.size()));
+  const int activeExt = std::min(tstep, static_cast<int>(ext.size()));
+  const auto finite = [](const dfloat value) { return std::isfinite(value); };
+  coefficientsValid &= std::all_of(bdf.begin(), bdf.end(), finite);
+  coefficientsValid &= std::all_of(ext.begin(), ext.end(), finite);
+  coefficientsValid &= std::all_of(bdf.begin() + activeBdf, bdf.end(), [](const dfloat value) {
+    return value == 0.0;
+  });
+  coefficientsValid &= std::all_of(ext.begin() + activeExt, ext.end(), [](const dfloat value) {
+    return value == 0.0;
+  });
+  const dfloat coefficientTolerance = 100 * std::numeric_limits<dfloat>::epsilon();
+  const dfloat bdfSum = std::accumulate(bdf.begin(), bdf.begin() + activeBdf, static_cast<dfloat>(0));
+  const dfloat extSum = std::accumulate(ext.begin(), ext.begin() + activeExt, static_cast<dfloat>(0));
+  coefficientsValid &= std::abs(bdfSum - nrs->g0) <=
+                       coefficientTolerance * std::max(static_cast<dfloat>(1), std::abs(nrs->g0));
+  coefficientsValid &= std::abs(extSum - 1.0) <= coefficientTolerance;
+
+  if (platform->comm.mpiRank() == 0) {
+    printf("IBM phase0 step=%d dt=%.8e BDF", tstep, nrs->dt[0]);
+    for (const auto value : bdf) {
+      printf(" %.8e", value);
+    }
+    printf(" EXT");
+    for (const auto value : ext) {
+      printf(" %.8e", value);
+    }
+    printf("\n");
+  }
+}
+} // namespace
+
+void UDF_LoadKernels(deviceKernelProperties& kernelInfo)
+{
+  kernelInfo.define("p_blockSize") = 256;
+  kernelInfo.define("p_sourceAx") = sourceAcceleration[0];
+  kernelInfo.define("p_sourceAy") = sourceAcceleration[1];
+  kernelInfo.define("p_sourceAz") = sourceAcceleration[2];
+}
+
+void UDF_Setup0(MPI_Comm comm, setupAide& options)
+{
+  (void)comm;
+  platform->par->extract("casedata", "feedback_gain", feedbackGain);
+  platform->par->extract("casedata", "target_ux", targetVelocity[0]);
+  platform->par->extract("casedata", "target_uy", targetVelocity[1]);
+  platform->par->extract("casedata", "target_uz", targetVelocity[2]);
+  platform->par->extract("casedata", "source_ax", sourceAcceleration[0]);
+  platform->par->extract("casedata", "source_ay", sourceAcceleration[1]);
+  platform->par->extract("casedata", "source_az", sourceAcceleration[2]);
+
+  options.getArgs("CI-MODE", ciMode);
+  constantSourceMode = ciMode >= 1 && ciMode <= 5;
+  variableDtMode = ciMode == 5;
+
+  if (constantSourceMode) {
+    const std::string order = ciMode == 3 ? "1" : (ciMode == 4 ? "2" : "3");
+    options.setArgs("FLUID DENSITY", ciMode == 2 ? "5.0" : "2.0");
+    options.setArgs("BDF ORDER", order);
+    options.setArgs("EXT ORDER", order);
+  }
+
+  options.getArgs("DT", initialDt);
+}
+
+void UDF_Setup()
+{
+  auto mesh = nrs->meshV;
+  const int rank = platform->comm.mpiRank();
+
+  std::vector<dfloat> localJw(mesh->Nlocal);
+  mesh->o_Jw.copyTo(localJw.data(), localJw.size());
+  dfloat normalization = std::accumulate(localJw.begin(), localJw.end(), static_cast<dfloat>(0));
+  MPI_Allreduce(MPI_IN_PLACE,
+                &normalization,
+                1,
+                MPI_DFLOAT,
+                MPI_SUM,
+                platform->comm.mpiComm());
+  globalVolume = normalization;
+  nekrsCheck(!std::isfinite(normalization) || normalization <= 0.0,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "IBM phase0 marker has invalid normalization %.8e\n",
+             normalization);
+
+  std::vector<dlong> interpIndices(mesh->Nlocal);
+  std::iota(interpIndices.begin(), interpIndices.end(), 0);
+  std::vector<dfloat> interpWeights(mesh->Nlocal);
+  for (dlong n = 0; n < mesh->Nlocal; ++n) {
+    interpWeights[n] = localJw[n] / normalization;
+  }
+  dfloat interpolationSum = std::accumulate(interpWeights.begin(), interpWeights.end(), static_cast<dfloat>(0));
+  MPI_Allreduce(MPI_IN_PLACE,
+                &interpolationSum,
+                1,
+                MPI_DFLOAT,
+                MPI_SUM,
+                platform->comm.mpiComm());
+  const dfloat operatorTolerance = 100 * std::numeric_limits<dfloat>::epsilon();
+  nekrsCheck(!std::isfinite(interpolationSum) ||
+                 std::abs(interpolationSum - 1.0) > operatorTolerance,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "IBM phase0 interpolation weights sum to %.16e instead of one\n",
+             interpolationSum);
+
+  o_interpOffsets = deviceMemory<dlong>(std::vector<dlong>{0, mesh->Nlocal});
+  o_interpIndices = deviceMemory<dlong>(interpIndices);
+  o_interpWeights = deviceMemory<dfloat>(interpWeights);
+
+  std::vector<dlong> spreadOffsets(mesh->Nlocal + 1);
+  std::iota(spreadOffsets.begin(), spreadOffsets.end(), 0);
+  o_spreadOffsets = deviceMemory<dlong>(spreadOffsets);
+  o_spreadIndices = deviceMemory<dlong>(std::vector<dlong>(mesh->Nlocal, 0));
+  o_spreadWeights = deviceMemory<dfloat>(std::vector<dfloat>(mesh->Nlocal, 1.0));
+
+  o_targetVelocity = deviceMemory<dfloat>(
+      std::vector<dfloat>{targetVelocity[0], targetVelocity[1], targetVelocity[2]});
+  o_markerVelocity.resize(3 * Nmarkers);
+  o_markerAcceleration.resize(3 * Nmarkers);
+  o_velocityError.resize(mesh->Nlocal);
+
+  const std::array<dfloat, 3> testForce = {0.75, -0.5, 0.25};
+  std::vector<dfloat> testVelocity(3 * nrs->fluid->fieldOffset, 0.0);
+  for (dlong n = 0; n < mesh->Nlocal; ++n) {
+    const dfloat value = 1.0 + 0.25 * rank + static_cast<dfloat>(n) / mesh->Nlocal;
+    testVelocity[n + 0 * nrs->fluid->fieldOffset] = value;
+    testVelocity[n + 1 * nrs->fluid->fieldOffset] = -0.5 * value;
+    testVelocity[n + 2 * nrs->fluid->fieldOffset] = 0.25 * value;
+  }
+  deviceMemory<dfloat> o_testVelocity(testVelocity);
+  std::array<dfloat, 3> interpolatedVelocity;
+  interpolateMarker(o_testVelocity, interpolatedVelocity);
+
+  o_markerAcceleration.copyFrom(testForce.data(), testForce.size());
+  deviceMemory<dfloat> o_spreadTest(3 * nrs->fluid->fieldOffset);
+  platform->linAlg->fill(3 * nrs->fluid->fieldOffset, 0.0, o_spreadTest);
+  ibm_spread(mesh->Nlocal,
+             Nmarkers,
+             nrs->fluid->fieldOffset,
+             o_spreadOffsets,
+             o_spreadIndices,
+             o_spreadWeights,
+             o_markerAcceleration,
+             o_spreadTest);
+
+  std::vector<dfloat> spreadTest(3 * nrs->fluid->fieldOffset);
+  o_spreadTest.copyTo(spreadTest);
+  std::array<dfloat, 3> spreadIntegral = {0.0, 0.0, 0.0};
+  dfloat eulerianWork = 0.0;
+  for (dlong n = 0; n < mesh->Nlocal; ++n) {
+    for (int component = 0; component < 3; ++component) {
+      const dfloat spreadValue = spreadTest[n + component * nrs->fluid->fieldOffset];
+      spreadIntegral[component] += spreadValue * localJw[n];
+      eulerianWork += testVelocity[n + component * nrs->fluid->fieldOffset] *
+                       spreadValue * localJw[n];
+    }
+  }
+  MPI_Allreduce(MPI_IN_PLACE,
+                spreadIntegral.data(),
+                static_cast<int>(spreadIntegral.size()),
+                MPI_DFLOAT,
+                MPI_SUM,
+                platform->comm.mpiComm());
+  MPI_Allreduce(MPI_IN_PLACE,
+                &eulerianWork,
+                1,
+                MPI_DFLOAT,
+                MPI_SUM,
+                platform->comm.mpiComm());
+
+  for (int component = 0; component < 3; ++component) {
+    const dfloat expectedForce = testForce[component] * normalization;
+    nekrsCheck(!std::isfinite(spreadIntegral[component]) ||
+                   std::abs(spreadIntegral[component] - expectedForce) >
+                       operatorTolerance * std::max(static_cast<dfloat>(1), std::abs(expectedForce)),
+               platform->comm.mpiComm(),
+               EXIT_FAILURE,
+               "IBM phase0 force conservation failed for component %d: %.16e != %.16e\n",
+               component,
+               spreadIntegral[component],
+               expectedForce);
+  }
+  const dfloat markerWork = normalization * std::inner_product(
+      interpolatedVelocity.begin(), interpolatedVelocity.end(), testForce.begin(), static_cast<dfloat>(0));
+  nekrsCheck(!std::isfinite(eulerianWork) || !std::isfinite(markerWork) ||
+                 std::abs(eulerianWork - markerWork) >
+                     operatorTolerance * std::max(static_cast<dfloat>(1), std::abs(markerWork)),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "IBM phase0 work identity failed: %.16e != %.16e\n",
+             eulerianWork,
+             markerWork);
+
+  nrs->userSource = &ibmForcing;
+
+  if (rank == 0) {
+    dfloat rho;
+    platform->options.getArgs("FLUID DENSITY", rho);
+    printf("IBM phase0: ciMode=%d mode=%s ranks=%d one marker over all element-local GLL entries, "
+           "normalization=%.8e I1=%.16e rho=%.8e gain=%.8e\n",
+           ciMode,
+           constantSourceMode ? "constant-source" : "feedback",
+           platform->comm.mpiCommSize(),
+           normalization,
+           interpolationSum,
+           rho,
+           feedbackGain);
+  }
+}
+
+void UDF_ExecuteStep(double time, int tstep)
+{
+  if (tstep == 0) {
+    return;
+  }
+
+  if (variableDtMode) {
+    const dfloat expectedDt = tstep == 2 ? 0.5 * initialDt : initialDt;
+    const dfloat tolerance = 100 * std::numeric_limits<dfloat>::epsilon() * initialDt;
+    timestepSequenceValid &= std::abs(nrs->dt[0] - expectedDt) <= tolerance;
+  }
+
+  std::array<dfloat, 3> completedVelocity;
+  interpolateMarker(nrs->fluid->o_U, completedVelocity);
+
+  auto o_divergence = opSEM::strongDivergence(
+      nrs->meshV, nrs->fluid->fieldOffset, nrs->fluid->o_U);
+  const dfloat divergenceRms = platform->linAlg->weightedNorm2(
+      nrs->meshV->Nlocal,
+      nrs->meshV->o_Jw,
+      o_divergence,
+      platform->comm.mpiComm()) /
+      std::sqrt(globalVolume);
+
+  dfloat callbackSlip2 = 0.0;
+  dfloat completedSlip2 = 0.0;
+  dfloat callbackError2 = 0.0;
+  for (int component = 0; component < 3; ++component) {
+    callbackSlip2 += std::pow(targetVelocity[component] - callbackVelocity[component], 2);
+    completedSlip2 += std::pow(targetVelocity[component] - completedVelocity[component], 2);
+    callbackError2 += std::pow(callbackVelocity[component] - sourceAcceleration[component] * (time - nrs->dt[0]), 2);
+  }
+  maxCallbackError = std::max(maxCallbackError, std::sqrt(callbackError2));
+
+  ibm_velocity_error(nrs->meshV->Nlocal,
+                     nrs->fluid->fieldOffset,
+                     sourceAcceleration[0] * time,
+                     sourceAcceleration[1] * time,
+                     sourceAcceleration[2] * time,
+                     nrs->fluid->o_U,
+                     o_velocityError);
+  const dfloat responseError = platform->linAlg->weightedNorm2(
+      nrs->meshV->Nlocal,
+      nrs->meshV->o_Jw,
+      o_velocityError,
+      platform->comm.mpiComm()) /
+      std::sqrt(globalVolume);
+  maxResponseError = std::max(maxResponseError, responseError);
+  maxDivergence = std::max(maxDivergence, divergenceRms);
+  if (!constantSourceMode) {
+    feedbackResponded |= completedSlip2 < callbackSlip2;
+  }
+
+  if (platform->comm.mpiRank() == 0) {
+    if (constantSourceMode) {
+      printf("IBM phase0 step=%d time=%.8e responseErrorRms=%.8e divergenceRms=%.8e\n",
+             tstep,
+             time,
+             responseError,
+             divergenceRms);
+    } else {
+      printf("IBM phase0 step=%d time=%.8e callbackSlip=%.8e completedSlip=%.8e divergenceRms=%.8e\n",
+             tstep,
+             time,
+             std::sqrt(callbackSlip2),
+             std::sqrt(completedSlip2),
+             divergenceRms);
+    }
+  }
+
+  checkAndPrintCoefficients(tstep);
+
+  if (nrs->lastStep) {
+    const dfloat tolerance = std::is_same<dfloat, float>::value ? 2e-5 : 5e-6;
+    const dfloat divergenceTolerance = std::is_same<dfloat, float>::value ? 2e-5 : 1e-5;
+    if (constantSourceMode) {
+      CiEvalTest("IBM source callback sees beginning-of-step state (max error " +
+                     to_string_f(maxCallbackError) + ")",
+                 maxCallbackError <= tolerance);
+      CiEvalTest("IBM constant-source velocity response (max RMS " +
+                     to_string_f(maxResponseError) + ")",
+                 maxResponseError <= tolerance);
+       CiEvalTest("IBM post-projection divergence (max RMS " +
+                      to_string_f(maxDivergence) + ")",
+                  maxDivergence <= divergenceTolerance);
+    } else {
+      const dfloat callbackSlip = std::sqrt(callbackSlip2);
+      const dfloat completedSlip = std::sqrt(completedSlip2);
+      const dfloat responseRatio = callbackSlip > 0 ? completedSlip / callbackSlip : 0.0;
+      CiEvalTest("IBM feedback diagnostics are finite (response ratio " +
+                     to_string_f(responseRatio) + ")",
+                 std::isfinite(callbackSlip) && std::isfinite(completedSlip) &&
+                     std::isfinite(divergenceRms));
+      CiEvalTest("IBM feedback produces a completed-step response", feedbackResponded);
+    }
+    CiEvalTest("IBM BDF/EXT coefficient history", coefficientsValid);
+    if (variableDtMode) {
+      CiEvalTest("IBM variable timestep sequence", timestepSequenceValid);
+    }
+    CiFinalize();
+  }
+
+  if (variableDtMode && !nrs->lastStep) {
+    platform->options.setArgs("DT", to_string_f(tstep == 1 ? 0.5 * initialDt : initialDt));
+  }
+}

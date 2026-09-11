@@ -58,6 +58,80 @@ CC=mpicc CXX=mpic++ FC=mpif77 ./build.sh [-DCMAKE_INSTALL_PREFIX=$HOME/.local/ne
 ```
 Adjust the compilers as necessary. Make sure to remove the previous build and installation directory if updating.
 
+### Apple Silicon (MacBook M3)
+
+AppleClang is not currently supported on arm64. The following CPU-only setup uses
+Homebrew GCC 15 and builds MPICH with the same GNU toolchain. Keeping MPI and
+nekRS on one compiler toolchain avoids mixing AppleClang and GNU objects.
+
+Install the prerequisites (Homebrew uses `/opt/homebrew` on Apple Silicon):
+
+```sh
+xcode-select --install
+brew install cmake gcc wget
+```
+
+Download MPICH 4.3.2, then configure and install it in a user-owned prefix:
+
+```sh
+mkdir -p "$HOME/src"
+cd "$HOME/src"
+wget https://www.mpich.org/static/downloads/4.3.2/mpich-4.3.2.tar.gz
+tar -xzf mpich-4.3.2.tar.gz
+
+export MPICH_SRC=$HOME/src/mpich-4.3.2
+export MPICH_HOME=$HOME/.local/mpich-gcc15
+
+cd "$MPICH_SRC"
+CC=/opt/homebrew/bin/gcc-15 \
+CXX=/opt/homebrew/bin/g++-15 \
+FC=/opt/homebrew/bin/gfortran-15 \
+F77=/opt/homebrew/bin/gfortran-15 \
+./configure --prefix="$MPICH_HOME"
+make -j$(sysctl -n hw.logicalcpu)
+make install
+export PATH="$MPICH_HOME/bin:$PATH"
+```
+
+From the nekRS source directory, build the SERIAL C++ backend in a separate
+build directory:
+
+```sh
+export NEKRS_HOME=$HOME/.local/nekrs
+
+cmake -S . -B build-m3 \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_INSTALL_PREFIX="$NEKRS_HOME" \
+  -DCMAKE_C_COMPILER="$MPICH_HOME/bin/mpicc" \
+  -DCMAKE_CXX_COMPILER="$MPICH_HOME/bin/mpicxx" \
+  -DCMAKE_Fortran_COMPILER="$MPICH_HOME/bin/mpifort" \
+  -DOCCA_CXX=/opt/homebrew/bin/g++-15 \
+  -DOCCA_ENABLE_CUDA=OFF \
+  -DOCCA_ENABLE_HIP=OFF \
+  -DOCCA_ENABLE_DPCPP=OFF \
+  -DOCCA_ENABLE_OPENCL=OFF \
+  -DOCCA_ENABLE_METAL=OFF \
+  -DENABLE_HYPRE_GPU=OFF \
+  -DENABLE_ADIOS=OFF
+cmake --build build-m3 --target install -j$(sysctl -n hw.logicalcpu)
+```
+
+Add nekRS and the matching MPICH installation to the shell environment:
+
+```sh
+export MPICH_HOME=$HOME/.local/mpich-gcc15
+export NEKRS_HOME=$HOME/.local/nekrs
+export PATH="$NEKRS_HOME/bin:$MPICH_HOME/bin:$PATH"
+```
+
+Set `CPUONLY=1` when running a case so OCCA selects the SERIAL backend:
+
+```sh
+cp -a "$NEKRS_HOME/examples/ethier" "$HOME/ethier-test"
+cd "$HOME/ethier-test"
+CPUONLY=1 mpirun -np 1 nekrs --setup ethier.par
+```
+
 ## Setting the Environment
 
 Assuming you run `bash` and your install directory is $HOME/.local/nekrs, 
