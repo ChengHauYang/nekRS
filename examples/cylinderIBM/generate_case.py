@@ -76,28 +76,37 @@ def write_re2(path, nx=48, ny=32, nz=1):
 
         stream.write(struct.pack("<d", 0.0))
 
+        # boundaryTypeMap in cylinderIBM.par is (udfDirichlet, zeroNeumann),
+        # so boundary IDs are: 1 = udfDirichlet (freestream inlet + top/bottom),
+        # 2 = zeroNeumann (outflow). Periodic faces carry no ID.
+        DIRICHLET_ID = 1
+        NEUMANN_ID = 2
         boundaries = []
         for k in range(nz):
             for j in range(ny):
                 for i in range(nx):
                     element = 1 + i + nx * (j + ny * k)
                     if j == 0:
-                        boundaries.append((element, 1, "v", 0, 0))
+                        boundaries.append((element, 1, "v", 0, 0, DIRICHLET_ID))
                     if i == nx - 1:
-                        boundaries.append((element, 2, "O", 0, 0))
+                        boundaries.append((element, 2, "O", 0, 0, NEUMANN_ID))
                     if j == ny - 1:
-                        boundaries.append((element, 3, "v", 0, 0))
+                        boundaries.append((element, 3, "v", 0, 0, DIRICHLET_ID))
                     if i == 0:
-                        boundaries.append((element, 4, "v", 0, 0))
+                        boundaries.append((element, 4, "v", 0, 0, DIRICHLET_ID))
                     if k == 0:
                         peer = element + nx * ny * (nz - 1)
-                        boundaries.append((element, 5, "P", peer, 6))
+                        boundaries.append((element, 5, "P", peer, 6, 0))
                     if k == nz - 1:
                         peer = element - nx * ny * (nz - 1)
-                        boundaries.append((element, 6, "P", peer, 5))
+                        boundaries.append((element, 6, "P", peer, 5, 0))
 
         stream.write(struct.pack("<d", float(len(boundaries))))
-        for element, side, code, peer_element, peer_side in boundaries:
+        for element, side, code, peer_element, peer_side, bid in boundaries:
+            # bc(5) — the 5th BC parameter (7th value in the packed record) —
+            # carries the integer boundary ID that nekRS reads via
+            # nekInterface.f (boundaryID = bc(5,ifc,iel,ifld_bId)). Leaving it
+            # zero causes nekRS to report NboundaryIDs=0 and abort.
             stream.write(
                 struct.pack(
                     "<7d",
@@ -107,7 +116,7 @@ def write_re2(path, nx=48, ny=32, nz=1):
                     float(peer_side),
                     0.0,
                     0.0,
-                    0.0,
+                    float(bid),
                 )
             )
             stream.write(f"{code:<3}".encode("ascii").ljust(8, b" "))

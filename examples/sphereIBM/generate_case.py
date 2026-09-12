@@ -109,7 +109,13 @@ def write_unit_cube_re2(path, elements_per_direction=8):
 
         stream.write(struct.pack("<d", float(len(boundaries))))
         for element, side in boundaries:
-            stream.write(struct.pack("<7d", float(element), float(side), 0, 0, 0, 0, 0))
+            # bc(5) carries the integer boundary ID that nekRS reads via
+            # nekInterface.f (boundaryID = bc(5,ifc,iel,ifld_bId)); leaving it
+            # zero causes nekRS to see NboundaryIDs=0. All six outer faces
+            # share one ID because sphereIBM.par declares a single
+            # boundaryTypeMap entry (udfDirichlet), and the udf discriminates
+            # top-wall vs. no-slip by y-coordinate rather than by ID.
+            stream.write(struct.pack("<7d", float(element), float(side), 0, 0, 0, 0, 1.0))
             stream.write(b"W  ".ljust(8, b" "))
 
 
