@@ -28,6 +28,22 @@ ibm::StaticSurfaceIBM staticIbm;
 dfloat freeStreamVelocity = 1.0;
 dfloat cylinderDiameter = 1.0;
 dfloat spanLength = 1.0;
+dfloat statisticsStartTime = 80.0;
+dfloat forceOutputInterval = 0.1;
+dfloat fieldOutputInterval = 0.5;
+dfloat nextForceOutputTime = 80.0;
+dfloat nextFieldOutputTime = 80.0;
+
+bool outputDue(const dfloat time, const dfloat interval, dfloat & nextOutputTime)
+{
+  if (interval <= 0.0 || time + 0.5 * nrs->dt[0] < nextOutputTime)
+    return false;
+
+  do
+    nextOutputTime += interval;
+  while (time + 0.5 * nrs->dt[0] >= nextOutputTime);
+  return true;
+}
 }
 
 void ibmForcing(double time)
@@ -41,11 +57,19 @@ void UDF_Setup0(MPI_Comm, setupAide & options)
   platform->par->extract("casedata", "free_stream_velocity", freeStreamVelocity);
   platform->par->extract("casedata", "cylinder_diameter", cylinderDiameter);
   platform->par->extract("casedata", "span_length", spanLength);
+  platform->par->extract("casedata", "statistics_start_time", statisticsStartTime);
+  platform->par->extract("casedata", "force_output_interval", forceOutputInterval);
+  platform->par->extract("casedata", "field_output_interval", fieldOutputInterval);
+  nextForceOutputTime = statisticsStartTime;
+  nextFieldOutputTime = statisticsStartTime;
 
   int ciMode = 0;
   options.getArgs("CI-MODE", ciMode);
   if (ciMode)
+  {
     options.setArgs("END TIME", "0.004");
+    fieldOutputInterval = 0.0;
+  }
 }
 
 void UDF_Setup()
@@ -71,7 +95,12 @@ void UDF_LoadKernels(deviceKernelProperties & kernelInfo)
 
 void UDF_ExecuteStep(double time, int tstep)
 {
-  if (!nrs->lastStep && !nrs->checkpointStep)
+  const bool forceOutput = outputDue(time, forceOutputInterval, nextForceOutputTime);
+  const bool fieldOutput = outputDue(time, fieldOutputInterval, nextFieldOutputTime);
+  if (fieldOutput)
+    nrs->writeCheckpoint(time);
+
+  if (!nrs->lastStep && !forceOutput)
     return;
 
   const auto values = staticIbm.diagnostics();
