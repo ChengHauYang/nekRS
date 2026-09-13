@@ -80,9 +80,22 @@ void UDF_Setup()
   if (platform->options.getArgs("RESTART FILE NAME").empty())
   {
     auto mesh = nrs->meshV;
-    std::vector<dfloat> velocity(mesh->dim * nrs->fluid->fieldOffset, 0.0);
-    for (dlong n = 0; n < mesh->Nlocal; ++n)
+    const dlong offset = nrs->fluid->fieldOffset;
+    std::vector<dfloat> velocity(mesh->dim * offset, 0.0);
+    // IC = freestream at a small angle of attack (uy = 0.05 * U): a uniform
+    // transverse velocity across the whole domain. Applied ONLY at t=0. The
+    // udfDirichlet BC still forces (U, 0, 0) on the inlet/top/bottom, so the
+    // uniform uy is damped away by wall damping + advection within a few
+    // convective times, but during that window it feeds the antisymmetric
+    // wake mode enough for vortex shedding to develop by t~30-50 instead of
+    // waiting for numerical roundoff (~t>500). Uniform tilt is chosen over a
+    // localized bump because the localized version's integrated momentum is
+    // too small to leave a measurable Cl signature within a 150-unit run.
+    const dfloat pertUy = 0.05 * freeStreamVelocity;
+    for (dlong n = 0; n < mesh->Nlocal; ++n) {
       velocity[n] = freeStreamVelocity;
+      velocity[n + offset] = pertUy;
+    }
     nrs->fluid->o_U.copyFrom(velocity.data(), velocity.size());
   }
 }

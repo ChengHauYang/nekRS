@@ -3,7 +3,7 @@ userSections = CASEDATA
 [GENERAL]
 polynomialOrder = 5
 stopAt = endTime
-endTime = 150.0
+endTime = 200.0
 dt = targetCFL=0.5 + max=1e-2 + initial=1e-2
 timeStepper = tombo3
 checkpointControl = simulationTime
@@ -35,6 +35,6 @@ periodic_dimensions = z
 free_stream_velocity = 1.0
 cylinder_diameter = 1.0
 span_length = 1.0
-statistics_start_time = 80.0
+statistics_start_time = 0.0
 force_output_interval = 0.1
 field_output_interval = 0.5
