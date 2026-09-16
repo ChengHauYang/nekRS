@@ -1,0 +1,37 @@
+userSections = CASEDATA
+
+[GENERAL]
+polynomialOrder = 5
+stopAt = endTime
+endTime = 1.0
+dt = targetCFL=0.5 + max=5e-3 + initial=5e-3
+timeStepper = tombo3
+checkpointControl = simulationTime
+checkpointInterval = 0.1
+
+[PROBLEMTYPE]
+equation = navierStokes
+
+[FLUID PRESSURE]
+residualTol = 1e-08
+solver = cg+flexible
+smootherType = Jac+Cheby
+initialGuess = previous
+
+[FLUID VELOCITY]
+boundaryTypeMap = udfDirichlet, zeroNeumann
+residualTol = 1e-10
+rho = 1.0
+viscosity = 0.1
+
+[CASEDATA]
+stl_file = geometry/gyroid.stl
+stl_translation = 0.675, 0.675, 0.7575
+classify_elements = true
+marker_spacing = 0.02
+shell_thickness = 0.02
+support_radius = 0.08
+gaussian_width = 0.04
+max_subdivision_depth = 30
+periodic_dimensions = none
+inlet_velocity = 1.0

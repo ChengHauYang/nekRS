@@ -7,6 +7,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ibm
@@ -179,6 +180,46 @@ inline void sampleTriangle(const Triangle & triangle,
 inline double triangleArea(const Triangle & triangle)
 {
   return detail::triangleArea(triangle);
+}
+
+inline std::array<double, 3> parseTranslation(const std::string & value)
+{
+  std::string cleaned = value;
+  for (char & character : cleaned)
+    if (character == ',' || character == '(' || character == ')' ||
+        character == '[' || character == ']')
+      character = ' ';
+
+  std::istringstream input(cleaned);
+  std::array<double, 3> translation = {{0.0, 0.0, 0.0}};
+  for (double & component : translation)
+  {
+    if (!(input >> component) || !std::isfinite(component))
+      throw std::invalid_argument("stl_translation must contain three finite numbers");
+  }
+
+  std::string extra;
+  if (input >> extra)
+    throw std::invalid_argument("stl_translation must contain exactly three numbers");
+  return translation;
+}
+
+inline void translateTriangles(std::vector<Triangle> & triangles,
+                               const std::array<double, 3> & translation)
+{
+  if (!std::isfinite(translation[0]) || !std::isfinite(translation[1]) ||
+      !std::isfinite(translation[2]))
+    throw std::invalid_argument("STL translation components must be finite");
+
+  for (auto & triangle : triangles)
+    for (auto & vertex : triangle.vertex)
+    {
+      vertex.x += translation[0];
+      vertex.y += translation[1];
+      vertex.z += translation[2];
+      if (!detail::finite(vertex))
+        throw std::runtime_error("STL translation produced a non-finite coordinate");
+    }
 }
 
 inline MarkerSet sampleStaticSurface(const std::vector<Triangle> & triangles,

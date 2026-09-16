@@ -6,10 +6,10 @@ void udfDirichlet(bcData * bc)
 {
   if (isField("FLUID VELOCITY"))
   {
-    const dfloat topWallTolerance = 1e-12;
-    bc->uxFluid = bc->y > 1.0 - topWallTolerance ? 1.0 : 0.0;
+    const dfloat inletTolerance = 1e-12;
+    bc->uxFluid = 0.0;
     bc->uyFluid = 0.0;
-    bc->uzFluid = 0.0;
+    bc->uzFluid = bc->z < inletTolerance ? p_inletVelocity : 0.0;
   }
 }
 
@@ -25,6 +25,7 @@ void udfDirichlet(bcData * bc)
 namespace
 {
 ibm::StaticSurfaceIBM staticIbm;
+dfloat inletVelocity = 1.0;
 }
 
 void ibmForcing(double time)
@@ -35,11 +36,12 @@ void ibmForcing(double time)
 void UDF_Setup0(MPI_Comm, setupAide & options)
 {
   staticIbm.configure(options);
+  platform->par->extract("casedata", "inlet_velocity", inletVelocity);
 
   int ciMode = 0;
   options.getArgs("CI-MODE", ciMode);
   if (ciMode)
-    options.setArgs("END TIME", "0.004");
+    options.setArgs("END TIME", "0.01");
 }
 
 void UDF_Setup()
@@ -53,6 +55,7 @@ void UDF_Setup()
 void UDF_LoadKernels(deviceKernelProperties & kernelInfo)
 {
   kernelInfo.define("p_blockSize") = 256;
+  kernelInfo.define("p_inletVelocity") = inletVelocity;
 }
 
 void UDF_ExecuteStep(double time, int tstep)
@@ -61,25 +64,29 @@ void UDF_ExecuteStep(double time, int tstep)
     return;
 
   const auto values = staticIbm.diagnostics();
+  const auto & counts = staticIbm.elementRegionCounts();
   if (platform->comm.mpiRank() == 0)
-    printf("sphereIBM step=%d time=%.8e slipMax=%.8e slipRms=%.8e "
-           "force=(%.8e, %.8e, %.8e)\n",
+    printf("gyroidIBM step=%d time=%.8e slipMax=%.8e slipRms=%.8e "
+           "force=(%.8e, %.8e, %.8e) elementRegions=(%llu fluid, %llu cut, %llu solid)\n",
            tstep,
            time,
            static_cast<double>(values.maximumSlip),
            static_cast<double>(values.rmsSlip),
            static_cast<double>(values.force[0]),
            static_cast<double>(values.force[1]),
-           static_cast<double>(values.force[2]));
+           static_cast<double>(values.force[2]),
+           counts.fluid,
+           counts.cut,
+           counts.solid);
 
   if (nrs->lastStep && staticIbm.ciMode())
   {
     const bool finite = std::isfinite(values.maximumSlip) && std::isfinite(values.rmsSlip) &&
                         std::isfinite(values.force[0]) && std::isfinite(values.force[1]) &&
                         std::isfinite(values.force[2]);
-    CiEvalTest("sphere IBM diagnostics are finite", finite);
-    CiEvalTest("sphere IBM receives nonzero lid-driven forcing",
-               std::abs(values.force[0]) > 1e-14 || values.maximumSlip > 1e-14);
+    CiEvalTest("gyroid IBM diagnostics are finite", finite);
+    CiEvalTest("gyroid IBM classified Fluid/Cut elements",
+               counts.fluid > 0 && counts.cut > 0);
     CiFinalize();
   }
 }

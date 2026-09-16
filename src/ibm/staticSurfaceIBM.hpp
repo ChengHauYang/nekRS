@@ -1,10 +1,13 @@
 #pragma once
 
+#include "elementClassification.hpp"
 #include "ibmGeometry.hpp"
 #include "ibmInteraction.hpp"
 #include "stl_reader.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -13,6 +16,7 @@
 #include <exception>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -39,6 +43,14 @@ public:
     platform->par->extract("casedata", "gaussian_width", _gaussianWidth);
     platform->par->extract("casedata", "max_subdivision_depth", _maxSubdivisionDepth);
     platform->par->extract("casedata", "periodic_dimensions", _periodicDimensions);
+    std::string classifyElements;
+    platform->par->extract("casedata", "classify_elements", classifyElements);
+    if (!classifyElements.empty())
+      _classifyElements = parseBool(classifyElements, "classify_elements");
+    std::string stlTranslation;
+    platform->par->extract("casedata", "stl_translation", stlTranslation);
+    if (!stlTranslation.empty())
+      _stlTranslation = parseTranslation(stlTranslation);
     options.getArgs("CI-MODE", _ciMode);
 
     if (_ciMode == 2)
@@ -60,6 +72,7 @@ public:
       {
         validateParameters();
         triangles = readBinaryStl(_stlFile);
+        translateTriangles(triangles, _stlTranslation);
         _markers = sampleStaticSurface(triangles,
                                        _markerSpacing,
                                        _shellThickness,
@@ -81,11 +94,13 @@ public:
                setupError.c_str());
     broadcastMarkerSet(_markers, 0, comm);
     validateBroadcastResult(_markers, comm);
+    if (_classifyElements)
+      broadcastTriangles(triangles, 0, comm);
 
     if (rank == 0)
       printGeometrySummary(triangles, statistics);
 
-    buildDeviceData(comm);
+    buildDeviceData(triangles, comm);
   }
 
   void applyForcing(double)
@@ -147,6 +162,9 @@ public:
 
   const MarkerSet & markers() const { return _markers; }
   bool broadcastValidationPassed() const { return _broadcastValidationPassed; }
+  bool hasElementClassification() const { return _classifyElements; }
+  const deviceMemory<dfloat> & elementRegionField() const { return _oElementRegionField; }
+  const ElementRegionCounts & elementRegionCounts() const { return _globalRegionCounts; }
   int ciMode() const { return _ciMode; }
 
 private:
@@ -170,6 +188,26 @@ private:
                "IBM %s contains %zu entries, exceeding MPI int count\n",
                name,
                count);
+  }
+
+  static bool parseBool(const std::string & value, const char * name)
+  {
+    std::string cleaned;
+    for (const char character : value)
+      if (!std::isspace(static_cast<unsigned char>(character)))
+        cleaned.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character))));
+
+    if (cleaned == "true" || cleaned == "1" || cleaned == "yes" ||
+        cleaned == "on")
+      return true;
+    if (cleaned == "false" || cleaned == "0" || cleaned == "no" ||
+        cleaned == "off")
+      return false;
+
+    std::ostringstream message;
+    message << name << " must be true or false";
+    throw std::invalid_argument(message.str());
   }
 
   static void broadcastRootError(std::string & message, const int root, MPI_Comm comm)
@@ -242,6 +280,53 @@ private:
               MPI_BYTE,
               root,
               comm);
+  }
+
+  static void broadcastTriangles(std::vector<Triangle> & triangles,
+                                 const int root,
+                                 MPI_Comm comm)
+  {
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+    unsigned long long count =
+        rank == root ? static_cast<unsigned long long>(triangles.size()) : 0;
+    MPI_Bcast(&count, 1, MPI_UNSIGNED_LONG_LONG, root, comm);
+
+    nekrsCheck(count > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max()) ||
+                   count > static_cast<unsigned long long>(INT_MAX / 9),
+               comm,
+               EXIT_FAILURE,
+               "%s",
+               "IBM triangle array cannot be represented safely for MPI broadcast\n");
+
+    const std::size_t triangleCount = static_cast<std::size_t>(count);
+    std::vector<double> packed(9 * triangleCount);
+    if (rank == root)
+      for (std::size_t triangle = 0; triangle < triangleCount; ++triangle)
+        for (int vertex = 0; vertex < 3; ++vertex)
+        {
+          const std::size_t base = 9 * triangle + 3 * vertex;
+          packed[base + 0] = triangles[triangle].vertex[vertex].x;
+          packed[base + 1] = triangles[triangle].vertex[vertex].y;
+          packed[base + 2] = triangles[triangle].vertex[vertex].z;
+        }
+
+    MPI_Bcast(packed.data(), static_cast<int>(packed.size()), MPI_DOUBLE, root, comm);
+
+    if (rank != root)
+    {
+      triangles.resize(triangleCount);
+      for (std::size_t triangle = 0; triangle < triangleCount; ++triangle)
+      {
+        triangles[triangle].sourceTriangle = triangle;
+        for (int vertex = 0; vertex < 3; ++vertex)
+        {
+          const std::size_t base = 9 * triangle + 3 * vertex;
+          triangles[triangle].vertex[vertex] = {
+              packed[base + 0], packed[base + 1], packed[base + 2]};
+        }
+      }
+    }
   }
 
   static std::uint64_t fnv1aAppend(std::uint64_t hash,
@@ -326,7 +411,8 @@ private:
         std::accumulate(_markers.volume.begin(), _markers.volume.end(), 0.0);
     printf("IBM geometry: triangles=%zu markers=%zu ranks=%d ell_marker=%.8e "
            "shellThickness=%.8e area=%.16e markerVolume=%.16e "
-           "dVp=[%.8e, %.8e] leafMaxEdge=[%.8e, %.8e]\n",
+           "dVp=[%.8e, %.8e] leafMaxEdge=[%.8e, %.8e] "
+           "stlTranslation=(%.8e, %.8e, %.8e)\n",
            triangles.size(),
            _markers.size(),
            platform->comm.mpiCommSize(),
@@ -337,10 +423,13 @@ private:
            static_cast<double>(*volumeRange.first),
            static_cast<double>(*volumeRange.second),
            statistics.minimumLeafMaxEdge,
-           statistics.maximumLeafMaxEdge);
+           statistics.maximumLeafMaxEdge,
+           _stlTranslation[0],
+           _stlTranslation[1],
+           _stlTranslation[2]);
   }
 
-  void buildDeviceData(MPI_Comm comm)
+  void buildDeviceData(const std::vector<Triangle> & triangles, MPI_Comm comm)
   {
     auto mesh = _nrs->meshV;
     std::vector<dfloat> x(mesh->Nlocal);
@@ -369,6 +458,43 @@ private:
     _oMarkerAcceleration = deviceMemory<dfloat>(_markers.targetVelocity);
     _oMarkerVelocity = deviceMemory<dfloat>(_markers.targetVelocity);
     _hostMarkerVelocity.resize(_markers.targetVelocity.size());
+
+    if (_classifyElements)
+      buildElementClassification(triangles, x, y, z, comm);
+  }
+
+  void buildElementClassification(const std::vector<Triangle> & triangles,
+                                  const std::vector<dfloat> & x,
+                                  const std::vector<dfloat> & y,
+                                  const std::vector<dfloat> & z,
+                                  MPI_Comm comm)
+  {
+    auto mesh = _nrs->meshV;
+    const auto localRegions = classifyElements(triangles,
+                                               x,
+                                               y,
+                                               z,
+                                               static_cast<std::size_t>(mesh->Nelements),
+                                               static_cast<std::size_t>(mesh->Np));
+    const auto localCounts = countElementRegions(localRegions);
+    const unsigned long long send[3] = {
+        localCounts.fluid, localCounts.cut, localCounts.solid};
+    unsigned long long recv[3] = {0, 0, 0};
+    MPI_Allreduce(send, recv, 3, MPI_UNSIGNED_LONG_LONG, MPI_SUM, comm);
+    _globalRegionCounts.fluid = recv[0];
+    _globalRegionCounts.cut = recv[1];
+    _globalRegionCounts.solid = recv[2];
+
+    const auto hostField =
+        makeElementRegionField(localRegions, static_cast<std::size_t>(mesh->Np));
+    _oElementRegionField = deviceMemory<dfloat>(hostField);
+
+    if (platform->comm.mpiRank() == 0)
+      printf("IBM element regions: fluid=%llu cut=%llu solid=%llu "
+             "scalar00=(Fluid=0, Cut=1, Solid=2)\n",
+             _globalRegionCounts.fluid,
+             _globalRegionCounts.cut,
+             _globalRegionCounts.solid);
   }
 
   void interpolate(const occa::memory & velocity)
@@ -395,14 +521,17 @@ private:
   InteractionMaps _maps;
 
   std::string _stlFile = "geometry/reference.stl";
+  std::array<double, 3> _stlTranslation = {{0.0, 0.0, 0.0}};
   double _markerSpacing = 0.4;
   double _shellThickness = 0.05;
   double _supportRadius = 0.5;
   double _gaussianWidth = 0.25;
   int _maxSubdivisionDepth = 30;
   std::string _periodicDimensions = "none";
+  bool _classifyElements = false;
   int _ciMode = 0;
   bool _broadcastValidationPassed = false;
+  ElementRegionCounts _globalRegionCounts;
 
   deviceMemory<dlong> _oInterpOffsets;
   deviceMemory<dlong> _oInterpIndices;
@@ -413,6 +542,7 @@ private:
   deviceMemory<dfloat> _oTargetVelocity;
   deviceMemory<dfloat> _oMarkerAcceleration;
   deviceMemory<dfloat> _oMarkerVelocity;
+  deviceMemory<dfloat> _oElementRegionField;
   std::vector<dfloat> _hostMarkerVelocity;
 };
 

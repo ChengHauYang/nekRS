@@ -75,6 +75,8 @@ void UDF_Setup0(MPI_Comm, setupAide & options)
 void UDF_Setup()
 {
   staticIbm.setup(nrs);
+  if (staticIbm.hasElementClassification())
+    nrs->addUserCheckpointField("scalar00", {staticIbm.elementRegionField()});
   nrs->userSource = &ibmForcing;
 
   if (platform->options.getArgs("RESTART FILE NAME").empty())
