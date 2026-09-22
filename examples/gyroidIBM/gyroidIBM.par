@@ -1,6 +1,7 @@
 userSections = CASEDATA
 
 [GENERAL]
+meshFile = gyroidIBM_cylinder.re2
 polynomialOrder = 5
 stopAt = endTime
 endTime = 1.0
