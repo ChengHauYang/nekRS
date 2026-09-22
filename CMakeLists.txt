@@ -378,7 +378,9 @@ install(DIRECTORY scripts/ DESTINATION bin
   FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 
 # Examples will follow a different policy -- only copy if source tree is newer than install tree
-file(GLOB_RECURSE EXAMPLE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/examples/*)
+# Exclude .cache directories: these hold transient artifacts generated when running examples
+file(GLOB_RECURSE EXAMPLE_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/examples/*)
+list(FILTER EXAMPLE_FILES EXCLUDE REGEX "/\\.cache/" )
 configure_file(${CMAKE_CURRENT_LIST_DIR}/cmake/install_examples.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/install_examples.cmake @ONLY)
 install(SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/install_examples.cmake)

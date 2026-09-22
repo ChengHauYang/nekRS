@@ -12,6 +12,9 @@ logfile
 *.dat
 .cache/
 .plans/
+*.png
+*.mp4
+*.pvsm
 
 .DS_Store
 

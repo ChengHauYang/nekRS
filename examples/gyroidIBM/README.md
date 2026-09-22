@@ -34,3 +34,31 @@ python3 generate_case.py
 The default mesh is intentionally modest for setup and inspection. Increase the
 element counts in `generate_case.py` and tighten the IBM length scales in
 `gyroidIBM.par` for production-quality runs.
+
+## Build
+
+This example uses a development-only IBM API (`hasElementClassification`,
+`elementRegionField`, `elementRegionCounts`), so a build from the current
+source tree (not a release install) is required:
+
+```bash
+cd ~/packages/nekRS
+cmake --build build -j$(nproc)     # build (requires build/ configured with CUDA)
+cmake --install build              # install (overwrites ~/.local/nekrs)
+```
+
+## Run
+
+Requires the `nekrs` binary on your `PATH`. One MPI rank per GPU is the default
+(`device-id = LOCAL-RANK`); with `-np` larger than the GPU count, add
+`--device-id 0` so all ranks share the first GPU.
+
+A single `--setup` invocation compiles the UDF and runs the simulation:
+
+```bash
+mpirun -np 2 nekrs --setup gyroidIBM.par            # 1 rank per GPU
+# or force all ranks onto GPU 0:
+mpirun -np 6 nekrs --setup gyroidIBM.par --device-id 0
+```
+
+Run from this directory so `gyroidIBM.par` and the case files resolve.
