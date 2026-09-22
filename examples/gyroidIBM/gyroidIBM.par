@@ -3,11 +3,11 @@ userSections = CASEDATA
 [GENERAL]
 polynomialOrder = 5
 stopAt = endTime
-endTime = 1.0
-dt = targetCFL=0.5 + max=5e-3 + initial=5e-3
+endTime = 20.0
+dt = 1.0
 timeStepper = tombo3
 checkpointControl = simulationTime
-checkpointInterval = 0.1
+checkpointInterval = 2.0
 
 [PROBLEMTYPE]
 equation = navierStokes

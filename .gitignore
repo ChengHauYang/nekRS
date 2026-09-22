@@ -19,3 +19,5 @@ logfile
 .DS_Store
 
 *build*
+
+tex
