@@ -1,7 +1,6 @@
 userSections = CASEDATA
 
 [GENERAL]
-meshFile = gyroidIBM_cylinder.re2
 polynomialOrder = 5
 stopAt = endTime
 endTime = 20.0
@@ -12,6 +11,9 @@ checkpointInterval = 1.0
 
 [PROBLEMTYPE]
 equation = navierStokes
+
+[MESH]
+file = "gyroidIBM_cylinder.re2"
 
 [FLUID PRESSURE]
 residualTol = 1e-08
