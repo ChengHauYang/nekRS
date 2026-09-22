@@ -28,6 +28,8 @@ struct StaticSurfaceDiagnostics
 {
   dfloat maximumSlip = 0;
   dfloat rmsSlip = 0;
+  dfloat maximumMarkerVelocity = 0;
+  dfloat meanMarkerVelocity = 0;
   dfloat force[3] = {0, 0, 0};
 };
 
@@ -43,6 +45,19 @@ public:
     platform->par->extract("casedata", "gaussian_width", _gaussianWidth);
     platform->par->extract("casedata", "max_subdivision_depth", _maxSubdivisionDepth);
     platform->par->extract("casedata", "periodic_dimensions", _periodicDimensions);
+    std::string shellLayers;
+    platform->par->extract("casedata", "shell_layers", shellLayers);
+    if (!shellLayers.empty())
+    {
+      try
+      {
+        _shellLayers = std::stoi(shellLayers);
+      }
+      catch (const std::exception &)
+      {
+        throw std::invalid_argument("shell_layers must be a positive integer");
+      }
+    }
     std::string classifyElements;
     platform->par->extract("casedata", "classify_elements", classifyElements);
     if (!classifyElements.empty())
@@ -77,7 +92,8 @@ public:
                                        _markerSpacing,
                                        _shellThickness,
                                        static_cast<unsigned int>(_maxSubdivisionDepth),
-                                       &statistics);
+                                       &statistics,
+                                       _shellLayers);
         validateMarkers(triangles, _markers, _shellThickness);
       }
       catch (const std::exception & error)
@@ -136,20 +152,29 @@ public:
 
     StaticSurfaceDiagnostics result;
     double slipSquared = 0;
+    double markerVelocitySquared = 0;
     for (std::size_t p = 0; p < _markers.size(); ++p)
     {
       double markerSlipSquared = 0;
+      double markerVelocityNormSquared = 0;
       for (int component = 0; component < 3; ++component)
       {
         const std::size_t index = p + component * _markers.size();
-        const double slip = _hostMarkerVelocity[index] - _markers.targetVelocity[index];
+        const double markerVelocity = _hostMarkerVelocity[index];
+        const double slip = markerVelocity - _markers.targetVelocity[index];
         markerSlipSquared += slip * slip;
+        markerVelocityNormSquared += markerVelocity * markerVelocity;
       }
       result.maximumSlip = std::max(result.maximumSlip,
                                     static_cast<dfloat>(std::sqrt(markerSlipSquared)));
       slipSquared += markerSlipSquared;
+      result.maximumMarkerVelocity =
+          std::max(result.maximumMarkerVelocity,
+                   static_cast<dfloat>(std::sqrt(markerVelocityNormSquared)));
+      markerVelocitySquared += markerVelocityNormSquared;
     }
     result.rmsSlip = std::sqrt(slipSquared / _markers.size());
+    result.meanMarkerVelocity = std::sqrt(markerVelocitySquared / _markers.size());
 
     std::vector<dfloat> acceleration(3 * _markers.size());
     _oMarkerAcceleration.copyTo(acceleration);
@@ -174,6 +199,8 @@ private:
   {
     if (_maxSubdivisionDepth < 0)
       throw std::invalid_argument("max_subdivision_depth must be non-negative");
+    if (_shellLayers < 1)
+      throw std::invalid_argument("shell_layers must be a positive integer");
     if (!std::isfinite(_supportRadius) || _supportRadius <= 0)
       throw std::invalid_argument("support_radius must be finite and positive");
     if (!std::isfinite(_gaussianWidth) || _gaussianWidth <= 0)
@@ -444,6 +471,36 @@ private:
       mesh->o_Jw.copyTo(jw.data(), mesh->Nlocal);
     }
 
+    // Offset (shell-layer) markers can land outside the mesh when the STL sits
+    // within shellThickness/2 of the domain boundary; clamp them back inside so
+    // every marker remains supported by interacting nodes.
+    double localMin[3] = {std::numeric_limits<double>::max(),
+                          std::numeric_limits<double>::max(),
+                          std::numeric_limits<double>::max()};
+    double localMax[3] = {-std::numeric_limits<double>::max(),
+                          -std::numeric_limits<double>::max(),
+                          -std::numeric_limits<double>::max()};
+    if (mesh->Nlocal > 0)
+      for (dlong node = 0; node < mesh->Nlocal; ++node)
+      {
+        localMin[0] = std::min(localMin[0], static_cast<double>(x[node]));
+        localMin[1] = std::min(localMin[1], static_cast<double>(y[node]));
+        localMin[2] = std::min(localMin[2], static_cast<double>(z[node]));
+        localMax[0] = std::max(localMax[0], static_cast<double>(x[node]));
+        localMax[1] = std::max(localMax[1], static_cast<double>(y[node]));
+        localMax[2] = std::max(localMax[2], static_cast<double>(z[node]));
+      }
+    double globalMin[3];
+    double globalMax[3];
+    MPI_Allreduce(localMin, globalMin, 3, MPI_DOUBLE, MPI_MIN, comm);
+    MPI_Allreduce(localMax, globalMax, 3, MPI_DOUBLE, MPI_MAX, comm);
+    for (std::size_t p = 0; p < _markers.size(); ++p)
+      for (int component = 0; component < 3; ++component)
+        _markers.coordinates[p + component * _markers.size()] =
+            std::min(std::max(_markers.coordinates[p + component * _markers.size()],
+                              static_cast<dfloat>(globalMin[component])),
+                     static_cast<dfloat>(globalMax[component]));
+
     _maps = buildInteractionMaps(
         _markers, x, y, z, jw, _supportRadius, _gaussianWidth, comm, _periodicDimensions);
 
@@ -526,6 +583,7 @@ private:
   double _shellThickness = 0.05;
   double _supportRadius = 0.5;
   double _gaussianWidth = 0.25;
+  int _shellLayers = 1;
   int _maxSubdivisionDepth = 30;
   std::string _periodicDimensions = "none";
   bool _classifyElements = false;

@@ -85,6 +85,16 @@ inline double triangleArea(const Triangle & triangle)
                           subtract(triangle.vertex[2], triangle.vertex[0])));
 }
 
+inline Vec3 unitNormal(const Triangle & triangle)
+{
+  const Vec3 normal = cross(subtract(triangle.vertex[1], triangle.vertex[0]),
+                            subtract(triangle.vertex[2], triangle.vertex[0]));
+  const double magnitude = norm(normal);
+  if (!std::isfinite(magnitude) || magnitude == 0.0)
+    throw std::runtime_error("cannot compute a normal for a degenerate triangle");
+  return {normal.x / magnitude, normal.y / magnitude, normal.z / magnitude};
+}
+
 inline double maxEdgeLength(const Triangle & triangle)
 {
   return std::max({edgeLength(triangle.vertex[0], triangle.vertex[1]),
@@ -108,6 +118,7 @@ inline void sampleTriangle(const Triangle & triangle,
                            const double originalMaxEdge,
                            const double markerSpacing,
                            const double shellThickness,
+                           const int shellLayers,
                            const unsigned int depth,
                            const unsigned int maxSubdivisionDepth,
                            std::vector<Vec3> & positions,
@@ -119,20 +130,29 @@ inline void sampleTriangle(const Triangle & triangle,
   if (currentMaxEdge <= markerSpacing)
   {
     const double area = triangleArea(triangle);
-    const double volume = area * shellThickness;
-    const Vec3 position = centroid(triangle);
-    if (!finite(position) || !std::isfinite(volume) || volume <= 0.0)
-      throw std::runtime_error("IBM sampling generated a non-finite or non-positive marker");
-
-    positions.push_back(position);
-    volumes.push_back(volume);
-    sources.push_back(triangle.sourceTriangle);
-    if (statistics)
+    const double volumePerLayer = area * shellThickness / shellLayers;
+    const Vec3 center = centroid(triangle);
+    const Vec3 normal = unitNormal(triangle);
+    for (int layer = 0; layer < shellLayers; ++layer)
     {
-      statistics->minimumLeafMaxEdge =
-          std::min(statistics->minimumLeafMaxEdge, currentMaxEdge);
-      statistics->maximumLeafMaxEdge =
-          std::max(statistics->maximumLeafMaxEdge, currentMaxEdge);
+      const double offset =
+          (layer + 0.5) * shellThickness / shellLayers - 0.5 * shellThickness;
+      const Vec3 position = {center.x + offset * normal.x,
+                             center.y + offset * normal.y,
+                             center.z + offset * normal.z};
+      if (!finite(position) || !std::isfinite(volumePerLayer) || volumePerLayer <= 0.0)
+        throw std::runtime_error("IBM sampling generated a non-finite or non-positive marker");
+
+      positions.push_back(position);
+      volumes.push_back(volumePerLayer);
+      sources.push_back(triangle.sourceTriangle);
+      if (statistics)
+      {
+        statistics->minimumLeafMaxEdge =
+            std::min(statistics->minimumLeafMaxEdge, currentMaxEdge);
+        statistics->maximumLeafMaxEdge =
+            std::max(statistics->maximumLeafMaxEdge, currentMaxEdge);
+      }
     }
     return;
   }
@@ -167,6 +187,7 @@ inline void sampleTriangle(const Triangle & triangle,
                    originalMaxEdge,
                    markerSpacing,
                    shellThickness,
+                   shellLayers,
                    depth + 1,
                    maxSubdivisionDepth,
                    positions,
@@ -226,12 +247,15 @@ inline MarkerSet sampleStaticSurface(const std::vector<Triangle> & triangles,
                                      const double markerSpacing,
                                      const double shellThickness,
                                      const unsigned int maxSubdivisionDepth = 30,
-                                     SamplingStatistics * statistics = nullptr)
+                                     SamplingStatistics * statistics = nullptr,
+                                     const int shellLayers = 1)
 {
   if (!std::isfinite(markerSpacing) || markerSpacing <= 0.0)
     throw std::invalid_argument("markerSpacing must be finite and positive");
   if (!std::isfinite(shellThickness) || shellThickness <= 0.0)
     throw std::invalid_argument("shellThickness must be finite and positive");
+  if (shellLayers < 1)
+    throw std::invalid_argument("shellLayers must be at least one");
   if (triangles.empty())
     throw std::invalid_argument("cannot sample an empty STL surface");
 
@@ -251,6 +275,7 @@ inline MarkerSet sampleStaticSurface(const std::vector<Triangle> & triangles,
                            originalMaxEdge,
                            markerSpacing,
                            shellThickness,
+                           shellLayers,
                            0,
                            maxSubdivisionDepth,
                            positions,

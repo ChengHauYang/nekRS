@@ -4,11 +4,11 @@ userSections = CASEDATA
 meshFile = gyroidIBM_cylinder.re2
 polynomialOrder = 5
 stopAt = endTime
-endTime = 1.0
+endTime = 20.0
 dt = targetCFL=0.5 + max=5e-3 + initial=5e-3
 timeStepper = tombo3
 checkpointControl = simulationTime
-checkpointInterval = 0.1
+checkpointInterval = 1.0
 
 [PROBLEMTYPE]
 equation = navierStokes

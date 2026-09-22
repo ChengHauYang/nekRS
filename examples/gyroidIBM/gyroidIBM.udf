@@ -67,11 +67,13 @@ void UDF_ExecuteStep(double time, int tstep)
   const auto & counts = staticIbm.elementRegionCounts();
   if (platform->comm.mpiRank() == 0)
     printf("gyroidIBM step=%d time=%.8e slipMax=%.8e slipRms=%.8e "
-           "force=(%.8e, %.8e, %.8e) elementRegions=(%llu fluid, %llu cut, %llu solid)\n",
+           "VelMax=%.8e VelRms=%.8e force=(%.8e, %.8e, %.8e) elementRegions=(%llu fluid, %llu cut, %llu solid)\n",
            tstep,
            time,
            static_cast<double>(values.maximumSlip),
            static_cast<double>(values.rmsSlip),
+           static_cast<double>(values.maximumMarkerVelocity),
+           static_cast<double>(values.meanMarkerVelocity),
            static_cast<double>(values.force[0]),
            static_cast<double>(values.force[1]),
            static_cast<double>(values.force[2]),
@@ -84,7 +86,11 @@ void UDF_ExecuteStep(double time, int tstep)
     const bool finite = std::isfinite(values.maximumSlip) && std::isfinite(values.rmsSlip) &&
                         std::isfinite(values.force[0]) && std::isfinite(values.force[1]) &&
                         std::isfinite(values.force[2]);
+    const double forceMagnitude =
+        std::sqrt(values.force[0] * values.force[0] + values.force[1] * values.force[1] +
+                  values.force[2] * values.force[2]);
     CiEvalTest("gyroid IBM diagnostics are finite", finite);
+    CiEvalTest("gyroid IBM feedback force is applied", forceMagnitude > 0.0);
     CiEvalTest("gyroid IBM classified Fluid/Cut elements",
                counts.fluid > 0 && counts.cut > 0);
     CiFinalize();
